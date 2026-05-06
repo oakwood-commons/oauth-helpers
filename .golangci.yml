@@ -1,0 +1,63 @@
+version: "2"
+
+linters:
+  enable:
+    - asciicheck
+    - bodyclose
+    - dogsled
+    - dupl
+    - durationcheck
+    - errcheck
+    - errorlint
+    - exhaustive
+    - gocritic
+    - goprintffuncname
+    - gosec
+    - misspell
+    - nakedret
+    - nilerr
+    - noctx
+    - prealloc
+    - predeclared
+    - revive
+    - staticcheck
+    - tparallel
+    - unparam
+    - whitespace
+
+  settings:
+    gocritic:
+      disabled-checks:
+        - unlambda
+
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      # Exclude some linters from running on test files.
+      - path: _test\.go
+        linters:
+          - errcheck
+          - dupl
+          - gosec
+          - forcetypeassert
+          - revive
+          - gocritic
+
+formatters:
+  enable:
+    - gofumpt
+    - goimports
+  settings:
+    gofumpt:
+      extra-rules: true
+  exclusions:
+    generated: lax
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

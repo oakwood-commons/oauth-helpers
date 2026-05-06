@@ -8,13 +8,20 @@ import (
 	"fmt"
 	"os/exec"
 	"runtime"
+	"strings"
 )
 
 // OpenBrowser opens a URL in the default system browser.
 // Returns an error if the platform is unsupported or the command fails to start.
+// Only http:// and https:// URLs are allowed to prevent injection of dangerous
+// schemes (e.g. file://, javascript:).
 // The browser process runs asynchronously -- this function returns as soon as
 // the command is launched.
 func OpenBrowser(ctx context.Context, url string) error {
+	if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
+		return fmt.Errorf("refusing to open URL with non-HTTP scheme: %q", url)
+	}
+
 	var cmd string
 	var args []string
 
@@ -32,5 +39,5 @@ func OpenBrowser(ctx context.Context, url string) error {
 		return fmt.Errorf("unsupported platform: %s", runtime.GOOS)
 	}
 
-	return exec.CommandContext(ctx, cmd, args...).Start() //nolint:gosec // URL is from trusted internal config
+	return exec.CommandContext(ctx, cmd, args...).Start() //nolint:gosec // URL scheme validated above
 }
