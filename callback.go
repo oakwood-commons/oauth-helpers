@@ -5,6 +5,8 @@ package oauth
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"fmt"
 	"html"
 	"io"
@@ -218,7 +220,10 @@ func StartCallbackServer(ctx context.Context, port int, expectedState string, op
 
 	cs.server = &http.Server{
 		Handler:           mux,
+		ReadTimeout:       30 * time.Second,
 		ReadHeaderTimeout: 30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	go func() {
@@ -238,6 +243,9 @@ func (cs *CallbackServer) ResultChan() <-chan CallbackResult {
 
 // Close shuts down the callback server and its listener.
 func (cs *CallbackServer) Close() error {
+	if cs.server == nil {
+		return nil
+	}
 	return cs.server.Close()
 }
 
@@ -268,6 +276,12 @@ func authErrorHTML(escapedErrMsg string) string {
 }
 
 func (cs *CallbackServer) handleCallback(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		cs.sendResult(CallbackResult{Err: fmt.Errorf("method not allowed: %s", r.Method)})
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
 	code := r.URL.Query().Get("code")
 	if code == "" {
 		errMsg := r.URL.Query().Get("error")
@@ -279,6 +293,7 @@ func (cs *CallbackServer) handleCallback(w http.ResponseWriter, r *http.Request)
 			errMsg = fmt.Sprintf("%s: %s", errMsg, errDesc)
 		}
 		cs.sendResult(CallbackResult{Err: fmt.Errorf("OAuth error: %s", errMsg)})
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusBadRequest)
 		fmt.Fprint(w, authErrorHTML(html.EscapeString(errMsg)))
 		return
@@ -288,9 +303,12 @@ func (cs *CallbackServer) handleCallback(w http.ResponseWriter, r *http.Request)
 	// expectedState is set at construction before Serve() begins, so no
 	// synchronization is required.
 	if cs.expectedState != "" {
-		if r.URL.Query().Get("state") != cs.expectedState {
+		gotHash := sha256.Sum256([]byte(r.URL.Query().Get("state")))
+		expHash := sha256.Sum256([]byte(cs.expectedState))
+		if subtle.ConstantTimeCompare(gotHash[:], expHash[:]) != 1 {
 			errMsg := "state parameter mismatch (possible CSRF attack)"
 			cs.sendResult(CallbackResult{Err: fmt.Errorf("OAuth error: %s", errMsg)})
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			w.WriteHeader(http.StatusForbidden)
 			fmt.Fprint(w, authErrorHTML(html.EscapeString(errMsg)))
 			return
@@ -298,6 +316,7 @@ func (cs *CallbackServer) handleCallback(w http.ResponseWriter, r *http.Request)
 	}
 
 	cs.sendResult(CallbackResult{Code: code})
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprint(w, "<html><body><h1>Authentication Successful</h1><p>You can close this window and return to the terminal.</p></body></html>")
 }
 
@@ -325,7 +344,10 @@ func StartImplicitCallbackServer(ctx context.Context, port int, expectedState st
 
 	cs.server = &http.Server{
 		Handler:           mux,
+		ReadTimeout:       30 * time.Second,
 		ReadHeaderTimeout: 30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	go func() {
@@ -385,14 +407,24 @@ func (cs *CallbackServer) handleImplicitTokenPost(w http.ResponseWriter, r *http
 	// present in the request, but not all servers comply. Accept missing state (server
 	// didn't echo it back); reject only when the server returns a *different* state
 	// value.
+	//
+	// SECURITY NOTE: Accepting a missing state weakens CSRF protection. An attacker
+	// who can induce a redirect without a state parameter could potentially inject a
+	// token. Callers handling sensitive flows should prefer the authorization code
+	// grant (StartCallbackServer) which strictly rejects missing state.
 	if cs.expectedState != "" {
 		returnedState := params.Get("state")
-		if returnedState != "" && returnedState != cs.expectedState {
-			errMsg := "state parameter mismatch (possible CSRF attack)"
-			cs.sendResult(CallbackResult{Err: fmt.Errorf("OAuth error: %s", errMsg)})
-			w.WriteHeader(http.StatusForbidden)
-			fmt.Fprint(w, authErrorHTML(html.EscapeString(errMsg)))
-			return
+		if returnedState != "" {
+			gotHash := sha256.Sum256([]byte(returnedState))
+			expHash := sha256.Sum256([]byte(cs.expectedState))
+			if subtle.ConstantTimeCompare(gotHash[:], expHash[:]) != 1 {
+				errMsg := "state parameter mismatch (possible CSRF attack)"
+				cs.sendResult(CallbackResult{Err: fmt.Errorf("OAuth error: %s", errMsg)})
+				w.Header().Set("Content-Type", "text/html; charset=utf-8")
+				w.WriteHeader(http.StatusForbidden)
+				fmt.Fprint(w, authErrorHTML(html.EscapeString(errMsg)))
+				return
+			}
 		}
 	}
 
@@ -404,6 +436,7 @@ func (cs *CallbackServer) handleImplicitTokenPost(w http.ResponseWriter, r *http
 			errMsg = fmt.Sprintf("%s: %s", errCode, errDesc)
 		}
 		cs.sendResult(CallbackResult{Err: fmt.Errorf("OAuth error: %s", errMsg)})
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusBadRequest)
 		fmt.Fprint(w, authErrorHTML(html.EscapeString(errMsg)))
 		return
