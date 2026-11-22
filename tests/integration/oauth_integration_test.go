@@ -359,9 +359,113 @@ func TestIntegration_XSSPrevention(t *testing.T) {
 
 	// The raw script tag must NOT appear in the HTML output
 	assert.NotContains(t, string(body), "<script>")
-	// The escaped version should be present
+	// The escaped version should be present without double-escaping
 	assert.Contains(t, string(body), "&lt;script&gt;")
+	assert.NotContains(t, string(body), "&amp;lt;")
+	assert.Contains(t, string(body), "color-scheme: dark")
 
 	// Drain the result channel
 	<-cs.ResultChan()
+}
+
+// TestIntegration_DeferredCompletion_FullLifecycle verifies end-to-end deferred
+// callback completion with custom HTML pages and graceful shutdown.
+func TestIntegration_DeferredCompletion_FullLifecycle(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	pages := oauth.CallbackPages{
+		SuccessHTML: []byte("<!DOCTYPE html><html><body><h1>Connected</h1></body></html>"),
+		FailureHTML: []byte("<!DOCTYPE html><html><body><h1>Sign-in Failed</h1></body></html>"),
+	}
+	cs, err := oauth.StartCallbackServer(ctx, 0, "int-def-state",
+		oauth.WithCallbackPages(pages),
+		oauth.WithDeferredCompletion(),
+	)
+	require.NoError(t, err)
+	defer cs.Close()
+
+	type deferredOutcome struct {
+		status int
+		body   string
+		csp    string
+		err    error
+	}
+	outCh := make(chan deferredOutcome, 1)
+	go func() {
+		resp, getErr := http.Get(cs.RedirectURI + "/?code=int-def-code&state=int-def-state") //nolint:noctx // test code
+		if getErr != nil {
+			outCh <- deferredOutcome{err: getErr}
+			return
+		}
+		defer resp.Body.Close()
+		body, readErr := io.ReadAll(resp.Body)
+		outCh <- deferredOutcome{
+			status: resp.StatusCode,
+			body:   string(body),
+			csp:    resp.Header.Get("Content-Security-Policy"),
+			err:    readErr,
+		}
+	}()
+
+	result := <-cs.ResultChan()
+	require.NoError(t, result.Err)
+	assert.Equal(t, "int-def-code", result.Code)
+
+	cs.Complete(true)
+
+	select {
+	case out := <-outCh:
+		require.NoError(t, out.err)
+		assert.Equal(t, http.StatusOK, out.status)
+		assert.Equal(t, string(pages.SuccessHTML), out.body)
+		assert.NotEmpty(t, out.csp)
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for deferred callback response")
+	}
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer shutdownCancel()
+	require.NoError(t, cs.Shutdown(shutdownCtx))
+
+	// Also verify Complete(false) delivers 503 + FailureHTML end-to-end.
+	csFail, err := oauth.StartCallbackServer(ctx, 0, "int-def-fail-state",
+		oauth.WithCallbackPages(pages),
+		oauth.WithDeferredCompletion(),
+	)
+	require.NoError(t, err)
+	defer csFail.Close()
+
+	failCh := make(chan deferredOutcome, 1)
+	go func() {
+		resp, getErr := http.Get(csFail.RedirectURI + "/?code=int-fail-code&state=int-def-fail-state") //nolint:noctx // test code
+		if getErr != nil {
+			failCh <- deferredOutcome{err: getErr}
+			return
+		}
+		defer resp.Body.Close()
+		body, readErr := io.ReadAll(resp.Body)
+		failCh <- deferredOutcome{
+			status: resp.StatusCode,
+			body:   string(body),
+			csp:    resp.Header.Get("Content-Security-Policy"),
+			err:    readErr,
+		}
+	}()
+
+	failRes := <-csFail.ResultChan()
+	require.NoError(t, failRes.Err)
+	csFail.Complete(false)
+
+	select {
+	case out := <-failCh:
+		require.NoError(t, out.err)
+		assert.Equal(t, http.StatusServiceUnavailable, out.status)
+		assert.Equal(t, string(pages.FailureHTML), out.body)
+		assert.NotEmpty(t, out.csp)
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for deferred failure response")
+	}
+
+	require.NoError(t, csFail.Shutdown(context.Background()))
 }

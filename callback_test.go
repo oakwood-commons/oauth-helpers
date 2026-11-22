@@ -36,6 +36,19 @@ func TestCallbackServer_ReceivesCode(t *testing.T) {
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	htmlBody := string(body)
+	assert.Contains(t, htmlBody, "Authentication Successful")
+	assert.Contains(t, htmlBody, "You can close this window and return to the terminal.")
+	assert.Contains(t, htmlBody, "color-scheme: dark")
+	assert.Contains(t, htmlBody, "<style>")
+	assert.Equal(t, 1, strings.Count(strings.ToLower(htmlBody), "<h1"))
+	assert.NotContains(t, strings.ToLower(htmlBody), "<script")
+	assert.Equal(t, finalPageCSP, resp.Header.Get("Content-Security-Policy"))
+	assert.Equal(t, "nosniff", resp.Header.Get("X-Content-Type-Options"))
+	assert.Equal(t, "no-store", resp.Header.Get("Cache-Control"))
+	assert.Equal(t, "no-referrer", resp.Header.Get("Referrer-Policy"))
 
 	select {
 	case result := <-cs.ResultChan():
@@ -123,6 +136,15 @@ func TestCallbackServer_HTMLEscapesErrors(t *testing.T) {
 	resp, err := http.Get(fmt.Sprintf("%s/?error=%s", cs.RedirectURI, "<script>alert('xss')</script>")) //nolint:noctx // test code
 	require.NoError(t, err)
 	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	htmlBody := string(body)
+	assert.Contains(t, htmlBody, "color-scheme: dark")
+	assert.Contains(t, htmlBody, "&lt;script&gt;alert(&#39;xss&#39;)&lt;/script&gt;")
+	assert.NotContains(t, strings.ToLower(htmlBody), "<script")
+	assert.NotContains(t, htmlBody, "&amp;lt;", "already-escaped error message must not be double-escaped")
+	assert.Equal(t, finalPageCSP, resp.Header.Get("Content-Security-Policy"))
 
 	// The error channel should still receive the result
 	select {
@@ -274,9 +296,20 @@ func TestImplicitCallbackServer_ServesHTMLPage(t *testing.T) {
 
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
+	htmlBody := string(body)
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
-	assert.Contains(t, string(body), "window.location.hash")
-	assert.Contains(t, string(body), "/token")
+	assert.Contains(t, htmlBody, "window.location.hash")
+	assert.Contains(t, htmlBody, "/token")
+	assert.Contains(t, htmlBody, "Completing authentication...")
+	assert.Contains(t, htmlBody, `<p id="status">Processing...</p>`)
+	assert.Contains(t, htmlBody, "color-scheme: dark")
+	assert.Contains(t, htmlBody, ".spinner")
+	assert.Contains(t, htmlBody, "prefers-reduced-motion: reduce")
+	assert.Equal(t, 1, strings.Count(htmlBody, "<h1"), "bridge page must have exactly one h1")
+	assert.NotContains(t, htmlBody, "https://", "bridge page must remain self-contained offline")
+	assert.NotContains(t, htmlBody, "http://", "bridge page must remain self-contained offline")
+	assert.Equal(t, implicitBridgeCSP(), resp.Header.Get("Content-Security-Policy"))
+	assert.Equal(t, "nosniff", resp.Header.Get("X-Content-Type-Options"))
 }
 
 func TestImplicitCallbackServer_ReceivesToken(t *testing.T) {
@@ -466,11 +499,20 @@ func TestImplicitCallbackServer_AllowsSameOrigin(t *testing.T) {
 }
 
 func TestAuthErrorHTML_ContainsTroubleshooting(t *testing.T) {
-	page := authErrorHTML("something went wrong")
+	page := authErrorHTML("something &lt;went&gt; wrong")
 	assert.Contains(t, page, "Authentication Failed")
-	assert.Contains(t, page, "something went wrong")
+	assert.Contains(t, page, "something &lt;went&gt; wrong")
+	assert.NotContains(t, page, "&amp;lt;", "pre-escaped input must not be double-escaped")
 	assert.Contains(t, page, "Troubleshooting")
+	assert.Contains(t, page, "<h2>Troubleshooting</h2>")
 	assert.Contains(t, page, "log in to your identity provider")
+	assert.Contains(t, page, "You can close this window.")
+	assert.Contains(t, page, "color-scheme: dark")
+	assert.Contains(t, page, "<style>")
+	assert.Equal(t, 1, strings.Count(strings.ToLower(page), "<h1"))
+	assert.NotContains(t, strings.ToLower(page), "<script")
+	assert.NotContains(t, strings.ToLower(page), "http://")
+	assert.NotContains(t, strings.ToLower(page), "https://")
 }
 
 func TestCallbackServer_ErrorPageIncludesTroubleshooting(t *testing.T) {
