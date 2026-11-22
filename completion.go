@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"net/http"
+	"strconv"
 	"time"
 )
 
@@ -51,6 +52,7 @@ func WithCallbackPages(pages CallbackPages) CallbackOption {
 		cloned.FailureHTML = append([]byte(nil), pages.FailureHTML...)
 	}
 	return func(c *callbackConfig) {
+		c.customPages = true
 		c.pages = cloned
 	}
 }
@@ -73,6 +75,9 @@ func WithDeferredCompletion() CallbackOption {
 // inert no-op.
 func (cs *CallbackServer) Complete(success bool) {
 	cs.completeOnce.Do(func() {
+		if cs.ctx != nil && cs.ctx.Err() != nil {
+			success = false
+		}
 		cs.completeOK = success
 		if cs.completeSig != nil {
 			close(cs.completeSig)
@@ -95,6 +100,9 @@ func (cs *CallbackServer) Shutdown(ctx context.Context) error {
 		return nil
 	}
 	cs.Complete(false)
+	if cs.stopCancelWatch != nil {
+		cs.stopCancelWatch()
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -111,24 +119,26 @@ func (cs *CallbackServer) Shutdown(ctx context.Context) error {
 }
 
 func (cs *CallbackServer) hasCustomPages() bool {
-	return len(cs.pages.SuccessHTML) > 0 || len(cs.pages.FailureHTML) > 0
+	return cs.customPages || len(cs.pages.SuccessHTML) > 0 || len(cs.pages.FailureHTML) > 0
 }
 
 func (cs *CallbackServer) enhancedMode() bool {
 	return cs.deferred || cs.hasCustomPages()
 }
 
-// resolveDeferred blocks until Complete is called, the server context finishes,
-// deferredWriteWindow elapses, or the client HTTP request disconnects.
+// resolveDeferred blocks until Complete settles (either explicitly or via the
+// server context cancellation watcher), deferredWriteWindow elapses, or the
+// client HTTP request disconnects.
 func (cs *CallbackServer) resolveDeferred(reqCtx context.Context) (settled, clientGone bool) {
+	if cs.completeSig == nil {
+		return false, false
+	}
 	timer := time.NewTimer(deferredWriteWindow)
 	defer timer.Stop()
 
 	select {
 	case <-cs.completeSig:
 		return cs.completeOK, false
-	case <-cs.ctx.Done():
-		return false, false
 	case <-timer.C:
 		return false, false
 	case <-reqCtx.Done():
@@ -162,24 +172,28 @@ func setSafePageHeaders(w http.ResponseWriter) {
 	h.Set("Content-Security-Policy", finalPageCSP)
 }
 
+func writeHTMLResponse(w http.ResponseWriter, status int, body []byte) {
+	setSafePageHeaders(w)
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(status)
+	_, _ = w.Write(body)
+}
+
 // writeErrorPage serves a callback error response with strict security headers.
 // Legacy callers (neither WithDeferredCompletion nor WithCallbackPages set)
 // receive authErrorHTML with the escaped error summary for backward
 // compatibility. Enhanced callers receive the configured FailureHTML (or
 // defaultFailureHTML) with zero provider error text in the browser DOM.
 func (cs *CallbackServer) writeErrorPage(w http.ResponseWriter, status int, escapedErrMsg string) {
-	setSafePageHeaders(w)
 	if !cs.enhancedMode() {
-		w.WriteHeader(status)
-		_, _ = fmt.Fprint(w, authErrorHTML(escapedErrMsg))
+		writeHTMLResponse(w, status, []byte(authErrorHTML(escapedErrMsg)))
 		return
 	}
 	body := []byte(defaultFailureHTML)
 	if len(cs.pages.FailureHTML) > 0 {
 		body = cs.pages.FailureHTML
 	}
-	w.WriteHeader(status)
-	_, _ = w.Write(body)
+	writeHTMLResponse(w, status, body)
 }
 
 // completeSuccess coordinates ResultChan delivery and final HTTP page writing.
@@ -229,9 +243,7 @@ func (cs *CallbackServer) writeFinalPage(w http.ResponseWriter, r *http.Request)
 	}
 
 	body, status := cs.finalDocument(settled)
-	setSafePageHeaders(w)
-	w.WriteHeader(status)
-	_, _ = w.Write(body)
+	writeHTMLResponse(w, status, body)
 	if rc != nil {
 		_ = rc.Flush()
 	}

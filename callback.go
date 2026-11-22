@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -75,6 +76,9 @@ type callbackConfig struct {
 	path string
 	// pages holds the deferred-completion final documents (WithCallbackPages).
 	pages CallbackPages
+	// customPages records that WithCallbackPages was explicitly configured,
+	// even when both HTML slices are empty (requesting safe generic fallbacks).
+	customPages bool
 	// deferred enables hold-the-response-until-Complete behavior.
 	deferred bool
 	// ioTimeout sets ReadTimeout, ReadHeaderTimeout, and WriteTimeout on http.Server.
@@ -188,8 +192,14 @@ func newCallbackServer(ctx context.Context, port int, expectedState string, opts
 		expectedState: expectedState,
 		ctx:           ctx,
 		pages:         cfg.pages,
+		customPages:   cfg.customPages,
 		deferred:      cfg.deferred,
 		completeSig:   make(chan struct{}),
+	}
+	if ctx != nil {
+		cs.stopCancelWatch = context.AfterFunc(ctx, func() {
+			cs.Complete(false)
+		})
 	}
 
 	return cs, &cfg, nil
@@ -215,8 +225,12 @@ type CallbackServer struct {
 
 	// ctx is the server's (flow) context; bounds deferred completion waits.
 	ctx context.Context
+	// stopCancelWatch unregisters the context.AfterFunc cancellation watcher.
+	stopCancelWatch func() bool
 	// pages holds the deferred-completion final documents.
 	pages CallbackPages
+	// customPages indicates WithCallbackPages was explicitly passed.
+	customPages bool
 	// deferred indicates WithDeferredCompletion was requested.
 	deferred bool
 	// Complete bookkeeping: completeOnce guards a one-shot settle;
@@ -284,6 +298,9 @@ func (cs *CallbackServer) Close() error {
 		return nil
 	}
 	cs.Complete(false)
+	if cs.stopCancelWatch != nil {
+		cs.stopCancelWatch()
+	}
 	return cs.server.Close()
 }
 
@@ -333,6 +350,17 @@ func authErrorHTML(escapedErrMsg string) string {
 	return authErrorHTMLPrefix + escapedErrMsg + authErrorHTMLSuffix
 }
 
+func writePlainError(w http.ResponseWriter, msg string, status int) {
+	body := msg + "\n"
+	h := w.Header()
+	h.Del("Content-Encoding")
+	h.Set("Content-Type", "text/plain; charset=utf-8")
+	h.Set("X-Content-Type-Options", "nosniff")
+	h.Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(status)
+	_, _ = io.WriteString(w, body)
+}
+
 func flushResponse(w http.ResponseWriter) {
 	if rc := http.NewResponseController(w); rc != nil {
 		_ = rc.Flush()
@@ -341,7 +369,7 @@ func flushResponse(w http.ResponseWriter) {
 
 func (cs *CallbackServer) handleCallback(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writePlainError(w, "method not allowed", http.StatusMethodNotAllowed)
 		flushResponse(w)
 		cs.sendResult(CallbackResult{Err: fmt.Errorf("method not allowed: %s", r.Method)})
 		return
@@ -435,9 +463,11 @@ func (cs *CallbackServer) handleImplicitCallback(w http.ResponseWriter, _ *http.
 	h.Set("Cache-Control", "no-store")
 	h.Set("Referrer-Policy", "no-referrer")
 	h.Set("Content-Security-Policy", implicitBridgeCSP())
+	h.Set("Content-Length", strconv.Itoa(len(implicitCallbackHTML)))
+	w.WriteHeader(http.StatusOK)
 	// The JavaScript extracts fragment parameters and POSTs them as form data
 	// to /token on the same origin. This runs entirely on localhost.
-	_, _ = fmt.Fprint(w, implicitCallbackHTML)
+	_, _ = io.WriteString(w, implicitCallbackHTML)
 }
 
 const maxImplicitTokenBody = 8192
@@ -446,7 +476,7 @@ const maxImplicitTokenBody = 8192
 // implicit grant callback page.
 func (cs *CallbackServer) handleImplicitTokenPost(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writePlainError(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -455,7 +485,7 @@ func (cs *CallbackServer) handleImplicitTokenPost(w http.ResponseWriter, r *http
 	// a forged token. When Origin is present it must match the local callback server's
 	// origin (scheme://host:port), not the full redirect URI which may include a path.
 	if origin := r.Header.Get("Origin"); origin != "" && origin != cs.origin {
-		http.Error(w, "cross-origin request rejected", http.StatusForbidden)
+		writePlainError(w, "cross-origin request rejected", http.StatusForbidden)
 		return
 	}
 
@@ -464,7 +494,7 @@ func (cs *CallbackServer) handleImplicitTokenPost(w http.ResponseWriter, r *http
 		if cs.enhancedMode() {
 			cs.writeErrorPage(w, http.StatusBadRequest, "")
 		} else {
-			http.Error(w, "bad request", http.StatusBadRequest)
+			writePlainError(w, "bad request", http.StatusBadRequest)
 		}
 		flushResponse(w)
 		cs.sendResult(CallbackResult{Err: fmt.Errorf("read implicit token POST: %w", err)})
@@ -476,7 +506,7 @@ func (cs *CallbackServer) handleImplicitTokenPost(w http.ResponseWriter, r *http
 		if cs.enhancedMode() {
 			cs.writeErrorPage(w, http.StatusBadRequest, "")
 		} else {
-			http.Error(w, "bad request", http.StatusBadRequest)
+			writePlainError(w, "bad request", http.StatusBadRequest)
 		}
 		flushResponse(w)
 		cs.sendResult(CallbackResult{Err: fmt.Errorf("parse implicit token POST: %w", err)})
@@ -527,7 +557,7 @@ func (cs *CallbackServer) handleImplicitTokenPost(w http.ResponseWriter, r *http
 		if cs.enhancedMode() {
 			cs.writeErrorPage(w, http.StatusBadRequest, "")
 		} else {
-			http.Error(w, "missing access_token", http.StatusBadRequest)
+			writePlainError(w, "missing access_token", http.StatusBadRequest)
 		}
 		flushResponse(w)
 		cs.sendResult(CallbackResult{Err: fmt.Errorf("OAuth error: no access_token in redirect fragment")})

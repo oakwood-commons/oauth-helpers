@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -781,5 +782,243 @@ func TestWithCallbackPages_AsymmetricFallback(t *testing.T) {
 
 		assert.Equal(t, http.StatusOK, status)
 		assert.Equal(t, defaultSuccessHTML, body)
+	})
+}
+
+func TestWithCallbackPages_EmptyStructUsesEnhancedSafeFallbacks(t *testing.T) {
+	t.Run("success serves defaultSuccessHTML", func(t *testing.T) {
+		ctx := context.Background()
+		cs, err := StartCallbackServer(ctx, 0, "st", WithCallbackPages(CallbackPages{}))
+		require.NoError(t, err)
+		defer cs.Close()
+
+		resp, err := http.Get(cs.RedirectURI + "/?code=ok&state=st") //nolint:noctx // test code
+		require.NoError(t, err)
+		defer resp.Body.Close()
+
+		body, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Equal(t, defaultSuccessHTML, string(body))
+		assert.Equal(t, finalPageCSP, resp.Header.Get("Content-Security-Policy"))
+	})
+
+	t.Run("OAuth error serves defaultFailureHTML without exposing provider details", func(t *testing.T) {
+		ctx := context.Background()
+		cs, err := StartCallbackServer(ctx, 0, "st", WithCallbackPages(CallbackPages{}))
+		require.NoError(t, err)
+		defer cs.Close()
+
+		resp, err := http.Get(cs.RedirectURI + "/?error=access_denied&error_description=AADSTS99999+sensitive") //nolint:noctx // test code
+		require.NoError(t, err)
+		defer resp.Body.Close()
+
+		body, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		assert.Equal(t, defaultFailureHTML, string(body))
+		assert.NotContains(t, string(body), "AADSTS99999")
+		assert.NotContains(t, string(body), "Troubleshooting", "empty WithCallbackPages must opt into enhanced safe failure page")
+		assert.Equal(t, finalPageCSP, resp.Header.Get("Content-Security-Policy"))
+
+		res := <-cs.ResultChan()
+		require.Error(t, res.Err)
+		assert.Contains(t, res.Err.Error(), "AADSTS99999 sensitive")
+	})
+}
+
+func TestDeferredCompletion_PostCancellationCompleteTrueNeverServes200(t *testing.T) {
+	pages := CallbackPages{
+		SuccessHTML: []byte("<!doctype html><html><body>UNEXPECTED-200</body></html>"),
+		FailureHTML: []byte("<!doctype html><html><body>CANCELLED-503</body></html>"),
+	}
+
+	t.Run("cancel while handler parked before Complete(true)", func(t *testing.T) {
+		for i := 0; i < 100; i++ {
+			flowCtx, cancelFlow := context.WithCancel(context.Background())
+			cs, err := StartCallbackServer(flowCtx, 0, "st-race",
+				WithCallbackPages(pages),
+				WithDeferredCompletion(),
+			)
+			require.NoError(t, err)
+
+			type outcome struct {
+				status int
+				body   string
+				err    error
+			}
+			outCh := make(chan outcome, 1)
+			go func() {
+				resp, getErr := http.Get(cs.RedirectURI + "/?code=c&state=st-race") //nolint:noctx // test code
+				if getErr != nil {
+					outCh <- outcome{err: getErr}
+					return
+				}
+				defer resp.Body.Close()
+				b, readErr := io.ReadAll(resp.Body)
+				outCh <- outcome{status: resp.StatusCode, body: string(b), err: readErr}
+			}()
+
+			<-cs.ResultChan()
+			cancelFlow()
+			cs.Complete(true)
+
+			out := <-outCh
+			require.NoError(t, out.err)
+			require.Equal(t, http.StatusServiceUnavailable, out.status, "iteration %d", i)
+			require.Equal(t, string(pages.FailureHTML), out.body, "iteration %d", i)
+			_ = cs.Close()
+		}
+	})
+
+	t.Run("callback arrives after cancel and Complete(true)", func(t *testing.T) {
+		for i := 0; i < 100; i++ {
+			flowCtx, cancelFlow := context.WithCancel(context.Background())
+			cs, err := StartCallbackServer(flowCtx, 0, "st-late",
+				WithCallbackPages(pages),
+				WithDeferredCompletion(),
+			)
+			require.NoError(t, err)
+
+			cancelFlow()
+			cs.Complete(true)
+
+			resp, err := http.Get(cs.RedirectURI + "/?code=c&state=st-late") //nolint:noctx // test code
+			require.NoError(t, err)
+			b, readErr := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			require.NoError(t, readErr)
+			require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode, "iteration %d", i)
+			require.Equal(t, string(pages.FailureHTML), string(b), "iteration %d", i)
+			_ = cs.Close()
+		}
+	})
+}
+
+func TestDeferredCompletion_CompleteTrueImmediatelyBeforeCancelAlwaysServes200(t *testing.T) {
+	pages := CallbackPages{
+		SuccessHTML: []byte("<!doctype html><html><body>SETTLED-200</body></html>"),
+		FailureHTML: []byte("<!doctype html><html><body>UNEXPECTED-503</body></html>"),
+	}
+
+	for i := 0; i < 100; i++ {
+		flowCtx, cancelFlow := context.WithCancel(context.Background())
+		cs, err := StartCallbackServer(flowCtx, 0, "st-ok",
+			WithCallbackPages(pages),
+			WithDeferredCompletion(),
+		)
+		require.NoError(t, err)
+
+		type outcome struct {
+			status int
+			body   string
+			err    error
+		}
+		outCh := make(chan outcome, 1)
+		go func() {
+			resp, getErr := http.Get(cs.RedirectURI + "/?code=c&state=st-ok") //nolint:noctx // test code
+			if getErr != nil {
+				outCh <- outcome{err: getErr}
+				return
+			}
+			defer resp.Body.Close()
+			b, readErr := io.ReadAll(resp.Body)
+			outCh <- outcome{status: resp.StatusCode, body: string(b), err: readErr}
+		}()
+
+		<-cs.ResultChan()
+		cs.Complete(true)
+		cancelFlow()
+
+		out := <-outCh
+		require.NoError(t, out.err)
+		require.Equal(t, http.StatusOK, out.status, "iteration %d", i)
+		require.Equal(t, string(pages.SuccessHTML), out.body, "iteration %d", i)
+		_ = cs.Close()
+	}
+}
+
+func TestCallbackServer_ResponsesCarryFixedContentLengthAndSurviveImmediateClose(t *testing.T) {
+	assertFixedLength := func(t *testing.T, resp *http.Response, body []byte) {
+		t.Helper()
+		assert.Equal(t, strconv.Itoa(len(body)), resp.Header.Get("Content-Length"))
+		assert.NotContains(t, resp.TransferEncoding, "chunked")
+	}
+
+	t.Run("legacy success with immediate Close on ResultChan", func(t *testing.T) {
+		for i := 0; i < 25; i++ {
+			cs, err := StartCallbackServer(context.Background(), 0, "st")
+			require.NoError(t, err)
+
+			go func() {
+				<-cs.ResultChan()
+				_ = cs.Close()
+			}()
+
+			resp, err := http.Get(cs.RedirectURI + "/?code=ok&state=st") //nolint:noctx // test code
+			require.NoError(t, err)
+			body, readErr := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			require.NoError(t, readErr)
+			assert.Equal(t, http.StatusOK, resp.StatusCode)
+			assert.Equal(t, defaultSuccessHTML, string(body))
+			assertFixedLength(t, resp, body)
+		}
+	})
+
+	t.Run("legacy error and 405 plain error with immediate Close on ResultChan", func(t *testing.T) {
+		csErr, err := StartCallbackServer(context.Background(), 0, "st")
+		require.NoError(t, err)
+		go func() {
+			<-csErr.ResultChan()
+			_ = csErr.Close()
+		}()
+		respErr, err := http.Get(csErr.RedirectURI + "/?error=access_denied") //nolint:noctx // test code
+		require.NoError(t, err)
+		errBody, readErr := io.ReadAll(respErr.Body)
+		_ = respErr.Body.Close()
+		require.NoError(t, readErr)
+		assert.Equal(t, http.StatusBadRequest, respErr.StatusCode)
+		assertFixedLength(t, respErr, errBody)
+
+		cs405, err := StartCallbackServer(context.Background(), 0, "st")
+		require.NoError(t, err)
+		go func() {
+			<-cs405.ResultChan()
+			_ = cs405.Close()
+		}()
+		resp405, err := http.Post(cs405.RedirectURI+"/", "text/plain", strings.NewReader("")) //nolint:noctx // test code
+		require.NoError(t, err)
+		body405, readErr := io.ReadAll(resp405.Body)
+		_ = resp405.Body.Close()
+		require.NoError(t, readErr)
+		assert.Equal(t, http.StatusMethodNotAllowed, resp405.StatusCode)
+		assertFixedLength(t, resp405, body405)
+	})
+
+	t.Run("implicit bridge GET and token POST carry fixed Content-Length", func(t *testing.T) {
+		cs, err := StartImplicitCallbackServer(context.Background(), 0, "st")
+		require.NoError(t, err)
+
+		bridgeResp, err := http.Get(cs.RedirectURI + "/") //nolint:noctx // test code
+		require.NoError(t, err)
+		bridgeBody, readErr := io.ReadAll(bridgeResp.Body)
+		_ = bridgeResp.Body.Close()
+		require.NoError(t, readErr)
+		assert.Equal(t, implicitCallbackHTML, string(bridgeBody))
+		assertFixedLength(t, bridgeResp, bridgeBody)
+
+		go func() {
+			<-cs.ResultChan()
+			_ = cs.Close()
+		}()
+		postResp, err := http.Post(cs.RedirectURI+"/token", "application/x-www-form-urlencoded", strings.NewReader("access_token=tok&state=st")) //nolint:noctx // test code
+		require.NoError(t, err)
+		postBody, readErr := io.ReadAll(postResp.Body)
+		_ = postResp.Body.Close()
+		require.NoError(t, readErr)
+		assert.Equal(t, http.StatusOK, postResp.StatusCode)
+		assert.Equal(t, defaultSuccessHTML, string(postBody))
+		assertFixedLength(t, postResp, postBody)
 	})
 }
