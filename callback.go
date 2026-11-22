@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -65,9 +66,29 @@ func ValidateCallbackHostPath(host, path string) error {
 // CallbackOption configures optional parameters for the callback server.
 type CallbackOption func(*callbackConfig)
 
+const (
+	defaultServerIOTimeout   = 30 * time.Second
+	defaultServerIdleTimeout = 60 * time.Second
+)
+
 type callbackConfig struct {
 	host string
 	path string
+	// pages holds the deferred-completion final documents (WithCallbackPages).
+	pages CallbackPages
+	// customPages records that WithCallbackPages was explicitly configured,
+	// even when both HTML slices are empty (requesting safe generic fallbacks).
+	customPages bool
+	// deferred enables hold-the-response-until-Complete behavior.
+	deferred bool
+	// ioTimeout sets ReadTimeout, ReadHeaderTimeout, and WriteTimeout on http.Server.
+	ioTimeout time.Duration
+}
+
+func withServerIOTimeout(d time.Duration) CallbackOption {
+	return func(c *callbackConfig) {
+		c.ioTimeout = d
+	}
 }
 
 // WithCallbackHost sets the host used in the redirect URI (default: "localhost").
@@ -113,8 +134,9 @@ func validateCallbackConfig(cfg *callbackConfig) error {
 // responsible for registering HTTP handlers and calling Serve.
 func newCallbackServer(ctx context.Context, port int, expectedState string, opts ...CallbackOption) (*CallbackServer, *callbackConfig, error) {
 	cfg := callbackConfig{
-		host: "localhost",
-		path: "/",
+		host:      "localhost",
+		path:      "/",
+		ioTimeout: defaultServerIOTimeout,
 	}
 	for _, opt := range opts {
 		opt(&cfg)
@@ -168,6 +190,16 @@ func newCallbackServer(ctx context.Context, port int, expectedState string, opts
 		listener:      listener,
 		resultCh:      make(chan CallbackResult, 1),
 		expectedState: expectedState,
+		ctx:           ctx,
+		pages:         cfg.pages,
+		customPages:   cfg.customPages,
+		deferred:      cfg.deferred,
+		completeSig:   make(chan struct{}),
+	}
+	if ctx != nil {
+		cs.stopCancelWatch = context.AfterFunc(ctx, func() {
+			cs.Complete(false)
+		})
 	}
 
 	return cs, &cfg, nil
@@ -190,6 +222,22 @@ type CallbackServer struct {
 
 	expectedState string
 	resultOnce    sync.Once
+
+	// ctx is the server's (flow) context; bounds deferred completion waits.
+	ctx context.Context
+	// stopCancelWatch unregisters the context.AfterFunc cancellation watcher.
+	stopCancelWatch func() bool
+	// pages holds the deferred-completion final documents.
+	pages CallbackPages
+	// customPages indicates WithCallbackPages was explicitly passed.
+	customPages bool
+	// deferred indicates WithDeferredCompletion was requested.
+	deferred bool
+	// Complete bookkeeping: completeOnce guards a one-shot settle;
+	// completeOK is the settled outcome; completeSig is closed on settle.
+	completeOnce sync.Once
+	completeOK   bool
+	completeSig  chan struct{}
 }
 
 // StartCallbackServer creates and starts a local HTTP server on a localhost
@@ -203,12 +251,14 @@ type CallbackServer struct {
 // server begins accepting connections to close any race window.
 //
 // Options allow configuring the callback host (default "localhost") and path
-// (default "/") for OAuth2 servers that validate the exact redirect URI.
+// (default "/") for OAuth2 servers that validate the exact redirect URI, custom
+// completion HTML (WithCallbackPages), and deferred browser completion
+// (WithDeferredCompletion).
 //
 // The server waits for a single OAuth redirect, extracts the authorization
 // code (or error), and sends it on the channel returned by ResultChan().
 //
-// The caller is responsible for calling Close() when done.
+// The caller is responsible for calling Close() or Shutdown(ctx) when done.
 func StartCallbackServer(ctx context.Context, port int, expectedState string, opts ...CallbackOption) (*CallbackServer, error) {
 	cs, cfg, err := newCallbackServer(ctx, port, expectedState, opts...)
 	if err != nil {
@@ -220,10 +270,10 @@ func StartCallbackServer(ctx context.Context, port int, expectedState string, op
 
 	cs.server = &http.Server{
 		Handler:           mux,
-		ReadTimeout:       30 * time.Second,
-		ReadHeaderTimeout: 30 * time.Second,
-		WriteTimeout:      30 * time.Second,
-		IdleTimeout:       60 * time.Second,
+		ReadTimeout:       cfg.ioTimeout,
+		ReadHeaderTimeout: cfg.ioTimeout,
+		WriteTimeout:      cfg.ioTimeout,
+		IdleTimeout:       defaultServerIdleTimeout,
 	}
 
 	go func() {
@@ -241,10 +291,15 @@ func (cs *CallbackServer) ResultChan() <-chan CallbackResult {
 	return cs.resultCh
 }
 
-// Close shuts down the callback server and its listener.
+// Close shuts down the callback server and its listener. Any unsettled
+// deferred callback is marked failed before closing.
 func (cs *CallbackServer) Close() error {
 	if cs.server == nil {
 		return nil
+	}
+	cs.Complete(false)
+	if cs.stopCancelWatch != nil {
+		cs.stopCancelWatch()
 	}
 	return cs.server.Close()
 }
@@ -258,27 +313,65 @@ func (cs *CallbackServer) sendResult(r CallbackResult) {
 	})
 }
 
-// authErrorHTML returns an HTML error page with the error message and
-// troubleshooting advice. The errMsg must already be HTML-escaped.
+const authErrorHTMLPrefix = `<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Authentication Failed</title>
+<style>` + fallbackCardBaseCSS + `
+  .card { width: min(34rem, 100%); max-width: 34rem; border-color: rgba(255, 194, 142, 0.45); }
+  .badge { background: rgba(255, 194, 142, 0.14); color: #ffc28e; }
+  .error-detail { margin: 14px 0 0; padding: 10px 14px; border-radius: 8px; background: rgba(255, 194, 142, 0.08); border: 1px solid rgba(255, 194, 142, 0.25); color: #ffc28e; font-size: 0.9rem; line-height: 1.5; overflow-wrap: anywhere; }
+  h2 { margin: 20px 0 8px; font-size: 0.95rem; font-weight: 600; line-height: 1.35; color: #eff7ff; }
+  ul { margin: 0; padding-left: 20px; color: #9bafc4; font-size: 0.9rem; line-height: 1.55; }
+  li + li { margin-top: 6px; }
+  code { padding: 2px 6px; border-radius: 4px; background: rgba(155, 175, 196, 0.14); color: #eff7ff; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.85em; }
+  .footer { margin-top: 16px; font-size: 0.85rem; color: #8da4bd; }
+</style>
+</head>
+<body>
+<main class="card" role="alert">
+  <div class="row"><span class="badge" aria-hidden="true"><svg class="icon" viewBox="0 0 16 16" fill="none" focusable="false"><path d="M8 5V8.5M8 11H8.01" stroke="currentColor" stroke-width="1.75" stroke-linecap="round"/><circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="1.5"/></svg></span><h1>Authentication Failed</h1></div>
+  <p class="error-detail">`
+
+const authErrorHTMLSuffix = `</p>
+  <h2>Troubleshooting</h2>
+  <ul>
+    <li>Open a browser and log in to your identity provider (e.g. Azure, GitHub, Google) before retrying the CLI login.</li>
+    <li>Ensure your account has the required permissions for the requested scopes.</li>
+    <li>If you need additional scopes (e.g. for GitHub), re-run login with the --scope flag: <code>auth login &lt;handler&gt; --scope &lt;scope&gt;</code></li>
+    <li>Check that cookies and JavaScript are enabled in the browser that opened this page.</li>
+  </ul>
+  <p class="footer">You can close this window.</p>
+</main>
+</body></html>`
+
+// authErrorHTML returns a self-contained dark-card HTML error page with the
+// error message and troubleshooting advice. The escapedErrMsg argument must
+// already be HTML-escaped by the caller.
 func authErrorHTML(escapedErrMsg string) string {
-	return fmt.Sprintf(`<html><body>
-<h1>Authentication Failed</h1>
-<p>%s</p>
-<h2>Troubleshooting</h2>
-<ul>
-<li>Open a browser and log in to your identity provider (e.g. Azure, GitHub, Google) before retrying the CLI login.</li>
-<li>Ensure your account has the required permissions for the requested scopes.</li>
-<li>If you need additional scopes (e.g. for GitHub), re-run login with the --scope flag: <code>auth login &lt;handler&gt; --scope &lt;scope&gt;</code></li>
-<li>Check that cookies and JavaScript are enabled in the browser that opened this page.</li>
-</ul>
-<p>You can close this window.</p>
-</body></html>`, escapedErrMsg)
+	return authErrorHTMLPrefix + escapedErrMsg + authErrorHTMLSuffix
+}
+
+func writePlainError(w http.ResponseWriter, msg string, status int) {
+	body := msg + "\n"
+	h := w.Header()
+	h.Del("Content-Encoding")
+	h.Set("Content-Type", "text/plain; charset=utf-8")
+	h.Set("X-Content-Type-Options", "nosniff")
+	h.Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(status)
+	_, _ = io.WriteString(w, body)
+}
+
+func flushResponse(w http.ResponseWriter) {
+	if rc := http.NewResponseController(w); rc != nil {
+		_ = rc.Flush()
+	}
 }
 
 func (cs *CallbackServer) handleCallback(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
+		writePlainError(w, "method not allowed", http.StatusMethodNotAllowed)
+		flushResponse(w)
 		cs.sendResult(CallbackResult{Err: fmt.Errorf("method not allowed: %s", r.Method)})
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -292,10 +385,9 @@ func (cs *CallbackServer) handleCallback(w http.ResponseWriter, r *http.Request)
 		if errDesc != "" {
 			errMsg = fmt.Sprintf("%s: %s", errMsg, errDesc)
 		}
+		cs.writeErrorPage(w, http.StatusBadRequest, html.EscapeString(errMsg))
+		flushResponse(w)
 		cs.sendResult(CallbackResult{Err: fmt.Errorf("OAuth error: %s", errMsg)})
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.WriteHeader(http.StatusBadRequest)
-		fmt.Fprint(w, authErrorHTML(html.EscapeString(errMsg)))
 		return
 	}
 
@@ -307,17 +399,14 @@ func (cs *CallbackServer) handleCallback(w http.ResponseWriter, r *http.Request)
 		expHash := sha256.Sum256([]byte(cs.expectedState))
 		if subtle.ConstantTimeCompare(gotHash[:], expHash[:]) != 1 {
 			errMsg := "state parameter mismatch (possible CSRF attack)"
+			cs.writeErrorPage(w, http.StatusForbidden, html.EscapeString(errMsg))
+			flushResponse(w)
 			cs.sendResult(CallbackResult{Err: fmt.Errorf("OAuth error: %s", errMsg)})
-			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			w.WriteHeader(http.StatusForbidden)
-			fmt.Fprint(w, authErrorHTML(html.EscapeString(errMsg)))
 			return
 		}
 	}
 
-	cs.sendResult(CallbackResult{Code: code})
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprint(w, "<html><body><h1>Authentication Successful</h1><p>You can close this window and return to the terminal.</p></body></html>")
+	cs.completeSuccess(w, r, CallbackResult{Code: code})
 }
 
 // StartImplicitCallbackServer creates a local HTTP server for the OAuth2
@@ -330,6 +419,12 @@ func (cs *CallbackServer) handleCallback(w http.ResponseWriter, r *http.Request)
 // If expectedState is non-empty, a provided state value must match it. Unlike
 // StartCallbackServer, the implicit flow accepts a missing state value and
 // only rejects explicit mismatches.
+//
+// Options allow configuring the callback host (default "localhost"), path
+// (default "/"), custom completion HTML (WithCallbackPages), and deferred
+// browser completion (WithDeferredCompletion).
+//
+// The caller is responsible for calling Close() or Shutdown(ctx) when done.
 func StartImplicitCallbackServer(ctx context.Context, port int, expectedState string, opts ...CallbackOption) (*CallbackServer, error) {
 	cs, cfg, err := newCallbackServer(ctx, port, expectedState, opts...)
 	if err != nil {
@@ -344,10 +439,10 @@ func StartImplicitCallbackServer(ctx context.Context, port int, expectedState st
 
 	cs.server = &http.Server{
 		Handler:           mux,
-		ReadTimeout:       30 * time.Second,
-		ReadHeaderTimeout: 30 * time.Second,
-		WriteTimeout:      30 * time.Second,
-		IdleTimeout:       60 * time.Second,
+		ReadTimeout:       cfg.ioTimeout,
+		ReadHeaderTimeout: cfg.ioTimeout,
+		WriteTimeout:      cfg.ioTimeout,
+		IdleTimeout:       defaultServerIdleTimeout,
 	}
 
 	go func() {
@@ -362,10 +457,17 @@ func StartImplicitCallbackServer(ctx context.Context, port int, expectedState st
 // handleImplicitCallback serves the HTML page that extracts the access token
 // from the URL fragment and POSTs it back to the local server.
 func (cs *CallbackServer) handleImplicitCallback(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	h := w.Header()
+	h.Set("Content-Type", "text/html; charset=utf-8")
+	h.Set("X-Content-Type-Options", "nosniff")
+	h.Set("Cache-Control", "no-store")
+	h.Set("Referrer-Policy", "no-referrer")
+	h.Set("Content-Security-Policy", implicitBridgeCSP())
+	h.Set("Content-Length", strconv.Itoa(len(implicitCallbackHTML)))
+	w.WriteHeader(http.StatusOK)
 	// The JavaScript extracts fragment parameters and POSTs them as form data
 	// to /token on the same origin. This runs entirely on localhost.
-	fmt.Fprint(w, implicitCallbackHTML)
+	_, _ = io.WriteString(w, implicitCallbackHTML)
 }
 
 const maxImplicitTokenBody = 8192
@@ -374,7 +476,7 @@ const maxImplicitTokenBody = 8192
 // implicit grant callback page.
 func (cs *CallbackServer) handleImplicitTokenPost(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writePlainError(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -383,21 +485,31 @@ func (cs *CallbackServer) handleImplicitTokenPost(w http.ResponseWriter, r *http
 	// a forged token. When Origin is present it must match the local callback server's
 	// origin (scheme://host:port), not the full redirect URI which may include a path.
 	if origin := r.Header.Get("Origin"); origin != "" && origin != cs.origin {
-		http.Error(w, "cross-origin request rejected", http.StatusForbidden)
+		writePlainError(w, "cross-origin request rejected", http.StatusForbidden)
 		return
 	}
 
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxImplicitTokenBody))
 	if err != nil {
+		if cs.enhancedMode() {
+			cs.writeErrorPage(w, http.StatusBadRequest, "")
+		} else {
+			writePlainError(w, "bad request", http.StatusBadRequest)
+		}
+		flushResponse(w)
 		cs.sendResult(CallbackResult{Err: fmt.Errorf("read implicit token POST: %w", err)})
-		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
 
 	params, err := url.ParseQuery(string(body))
 	if err != nil {
+		if cs.enhancedMode() {
+			cs.writeErrorPage(w, http.StatusBadRequest, "")
+		} else {
+			writePlainError(w, "bad request", http.StatusBadRequest)
+		}
+		flushResponse(w)
 		cs.sendResult(CallbackResult{Err: fmt.Errorf("parse implicit token POST: %w", err)})
-		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
 
@@ -419,10 +531,9 @@ func (cs *CallbackServer) handleImplicitTokenPost(w http.ResponseWriter, r *http
 			expHash := sha256.Sum256([]byte(cs.expectedState))
 			if subtle.ConstantTimeCompare(gotHash[:], expHash[:]) != 1 {
 				errMsg := "state parameter mismatch (possible CSRF attack)"
+				cs.writeErrorPage(w, http.StatusForbidden, html.EscapeString(errMsg))
+				flushResponse(w)
 				cs.sendResult(CallbackResult{Err: fmt.Errorf("OAuth error: %s", errMsg)})
-				w.Header().Set("Content-Type", "text/html; charset=utf-8")
-				w.WriteHeader(http.StatusForbidden)
-				fmt.Fprint(w, authErrorHTML(html.EscapeString(errMsg)))
 				return
 			}
 		}
@@ -435,59 +546,106 @@ func (cs *CallbackServer) handleImplicitTokenPost(w http.ResponseWriter, r *http
 		if errDesc != "" {
 			errMsg = fmt.Sprintf("%s: %s", errCode, errDesc)
 		}
+		cs.writeErrorPage(w, http.StatusBadRequest, html.EscapeString(errMsg))
+		flushResponse(w)
 		cs.sendResult(CallbackResult{Err: fmt.Errorf("OAuth error: %s", errMsg)})
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.WriteHeader(http.StatusBadRequest)
-		fmt.Fprint(w, authErrorHTML(html.EscapeString(errMsg)))
 		return
 	}
 
 	accessToken := params.Get("access_token")
 	if accessToken == "" {
+		if cs.enhancedMode() {
+			cs.writeErrorPage(w, http.StatusBadRequest, "")
+		} else {
+			writePlainError(w, "missing access_token", http.StatusBadRequest)
+		}
+		flushResponse(w)
 		cs.sendResult(CallbackResult{Err: fmt.Errorf("OAuth error: no access_token in redirect fragment")})
-		http.Error(w, "missing access_token", http.StatusBadRequest)
 		return
 	}
 
-	cs.sendResult(CallbackResult{
+	cs.completeSuccess(w, r, CallbackResult{
 		AccessToken: accessToken,
 		TokenType:   params.Get("token_type"),
 		ExpiresIn:   params.Get("expires_in"),
 	})
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprint(w, "<html><body><h1>Authentication Successful</h1><p>You can close this window and return to the terminal.</p></body></html>")
 }
 
-// implicitCallbackHTML is the HTML page served by the implicit grant callback
-// server. It extracts the access token from the URL fragment (#access_token=...)
-// and POSTs it to /token on the same localhost server.
-const implicitCallbackHTML = `<!DOCTYPE html>
-<html><head><title>Authentication</title></head>
-<body>
-<h1>Completing authentication...</h1>
-<p id="status">Processing...</p>
-<script>
+// implicitBridgeScript extracts the URL fragment (#access_token=...), clears it
+// from the address bar, POSTs it to /token on the same localhost origin, and
+// renders the server's final HTML document inside a script-disabled sandboxed
+// iframe so bridge JS and final-page DOM remain isolated.
+const implicitBridgeScript = `
 (function() {
   var hash = window.location.hash.substring(1);
   if (!hash) {
+    document.body.className = "error";
     document.getElementById("status").textContent = "No token received.";
     return;
   }
+  history.replaceState(null, "", window.location.pathname);
   var xhr = new XMLHttpRequest();
   xhr.open("POST", "` + implicitTokenPath + `", true);
   xhr.setRequestHeader("Content-Type", "application/x-www-form-urlencoded");
   xhr.onload = function() {
+    var ct = xhr.getResponseHeader("Content-Type") || "";
+    if (xhr.responseText && ct.indexOf("text/html") !== -1) {
+      var frame = document.createElement("iframe");
+      frame.setAttribute("sandbox", "");
+      frame.setAttribute("title", "Authentication status");
+      frame.style.cssText = "position:fixed;inset:0;width:100%;height:100%;border:0;margin:0;padding:0;";
+      frame.srcdoc = xhr.responseText;
+      document.body.textContent = "";
+      document.body.style.margin = "0";
+      document.body.appendChild(frame);
+      return;
+    }
     if (xhr.status === 200) {
+      document.body.className = "done";
       document.getElementById("status").textContent = "Authentication successful. You can close this window.";
     } else {
+      document.body.className = "error";
       document.getElementById("status").textContent = "Authentication failed: " + xhr.statusText;
     }
   };
   xhr.onerror = function() {
+    document.body.className = "error";
     document.getElementById("status").textContent = "Failed to communicate with local server.";
   };
   xhr.send(hash);
-  history.replaceState(null, "", window.location.pathname);
 })();
-</script>
+`
+
+// implicitCallbackHTML is the HTML page served by the implicit grant callback
+// server. It extracts the access token from the URL fragment (#access_token=...)
+// and POSTs it to /token on the same localhost server. Inline styles use a
+// brand-neutral dark card so the interstitial avoids a white unstyled flash
+// while POST /token awaits deferred completion and renders cleanly if a
+// client-side fragment/network error leaves the user on this page.
+const implicitCallbackHTML = `<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Authentication</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; min-height: 100vh; min-height: 100svh; display: grid; place-items: center; padding: 24px; background: #05152a; color: #eff7ff; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  .card { width: min(28rem, 100%); padding: 32px 36px; border-radius: 12px; background: #071e3d; border: 1px solid rgba(120, 148, 175, 0.28); box-shadow: 0 20px 48px rgba(0, 0, 0, 0.4); }
+  .row { display: flex; align-items: center; gap: 14px; }
+  .spinner { width: 18px; height: 18px; flex-shrink: 0; border-radius: 50%; border: 2px solid rgba(155, 175, 196, 0.25); border-top-color: #38bdf8; animation: spin .75s linear infinite; }
+  h1 { margin: 0; font-size: 1.15rem; font-weight: 600; letter-spacing: -0.015em; line-height: 1.3; }
+  #status { margin: 12px 0 0; font-size: 0.925rem; line-height: 1.55; color: #9bafc4; }
+  body.done .spinner, body.error .spinner { display: none; }
+  body.done .card { border-color: rgba(164, 246, 197, 0.4); }
+  body.done #status { color: #a4f6c5; }
+  body.error .card { border-color: rgba(255, 194, 142, 0.45); }
+  body.error #status { color: #ffc28e; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { .spinner { animation: none; border-color: #38bdf8; } }
+</style>
+</head>
+<body>
+<main class="card" role="status" aria-live="polite">
+  <div class="row"><span class="spinner" aria-hidden="true"></span><h1>Completing authentication...</h1></div>
+  <p id="status">Processing...</p>
+</main>
+<script>` + implicitBridgeScript + `</script>
 </body></html>`
