@@ -79,8 +79,10 @@ _ = cs.Shutdown(context.Background())
 ## Design Principles
 
 - **Zero dependencies** beyond the Go standard library (test-only: testify)
-- **Security first** -- loopback-only binding, state validation, CORS checks,
-  strict CSP headers, HTML escaping, and path traversal prevention
+- **Security first** -- loopback-only binding, state-first constant-time CSRF
+  validation (forged requests return 403/405 without aborting active logins),
+  CORS checks, strict CSP headers, HTML escaping, terminal control-character
+  sanitization, and path traversal prevention
 - **Minimal API** -- just what auth handler plugins need, nothing more
 
 ## License

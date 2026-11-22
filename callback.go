@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // CallbackResult holds the outcome of a local OAuth callback.
@@ -69,6 +70,11 @@ type CallbackOption func(*callbackConfig)
 const (
 	defaultServerIOTimeout   = 30 * time.Second
 	defaultServerIdleTimeout = 60 * time.Second
+
+	// maxOAuthErrorRunes caps sanitized OAuth error code values.
+	maxOAuthErrorRunes = 128
+	// maxOAuthErrorDescRunes caps sanitized OAuth error_description values.
+	maxOAuthErrorDescRunes = 512
 )
 
 type callbackConfig struct {
@@ -246,9 +252,13 @@ type CallbackServer struct {
 // (useful when the app registration only allows specific redirect URIs).
 //
 // expectedState is the OAuth state parameter that must match the value returned
-// in the callback. If non-empty, the callback handler rejects responses whose
-// state does not match, preventing CSRF attacks. The state is set before the
-// server begins accepting connections to close any race window.
+// in the callback. If non-empty, the callback handler validates state in
+// constant time before inspecting error or code parameters and rejects missing
+// or mismatched state with 403 (without delivering a CallbackResult) so forged
+// local requests cannot abort an active login. Control characters in error and
+// error_description parameters are sanitized and length-capped before building
+// CallbackResult.Err. The state is set before the server begins accepting
+// connections to close any race window.
 //
 // Options allow configuring the callback host (default "localhost") and path
 // (default "/") for OAuth2 servers that validate the exact redirect URI, custom
@@ -367,43 +377,123 @@ func flushResponse(w http.ResponseWriter) {
 	}
 }
 
+// stateMatches compares got against expected in constant time, hashing both
+// with SHA-256 first so length differences do not leak expected's length.
+func stateMatches(got, expected string) bool {
+	gotHash := sha256.Sum256([]byte(got))
+	expHash := sha256.Sum256([]byte(expected))
+	return subtle.ConstantTimeCompare(gotHash[:], expHash[:]) == 1
+}
+
+// isDisallowedControlRune reports whether r is a C0 (< 0x20), DEL (0x7f),
+// C1 (U+0080..U+009F), or Unicode bidirectional formatting control character
+// that must not reach a caller's terminal.
+func isDisallowedControlRune(r rune) bool {
+	if r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) {
+		return true
+	}
+	return r == 0x061c || r == 0x200e || r == 0x200f ||
+		(r >= 0x202a && r <= 0x202e) ||
+		(r >= 0x2066 && r <= 0x2069)
+}
+
+// sanitizeOAuthError removes C0 (< 0x20), DEL (0x7f), C1 (U+0080..U+009F),
+// bidirectional formatting controls, and invalid UTF-8 bytes from untrusted
+// OAuth callback error fields (normalizing ASCII spaces, \t, \n, \r, and
+// Unicode line separators to single spaces) and caps the result to at most
+// maxRunes runes.
+func sanitizeOAuthError(s string, maxRunes int) string {
+	if s == "" || maxRunes <= 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.Grow(min(len(s), maxRunes*utf8.UTFMax))
+	count := 0
+	pendingSpace := false
+	for i := 0; i < len(s); {
+		r, width := utf8.DecodeRuneInString(s[i:])
+		i += width
+		if r == utf8.RuneError && width == 1 {
+			continue
+		}
+		if r == ' ' || r == '\t' || r == '\n' || r == '\r' || r == '\u2028' || r == '\u2029' {
+			if count > 0 {
+				pendingSpace = true
+			}
+			continue
+		}
+		if isDisallowedControlRune(r) {
+			continue
+		}
+		if pendingSpace {
+			if count+1 >= maxRunes {
+				break
+			}
+			b.WriteByte(' ')
+			count++
+			pendingSpace = false
+		}
+		b.WriteRune(r)
+		count++
+		if count >= maxRunes {
+			break
+		}
+	}
+	return b.String()
+}
+
+func formatOAuthError(rawErr, rawDesc string) string {
+	errCode := sanitizeOAuthError(rawErr, maxOAuthErrorRunes)
+	if errCode == "" {
+		errCode = "unknown_error"
+	}
+	errDesc := sanitizeOAuthError(rawDesc, maxOAuthErrorDescRunes)
+	if errDesc != "" {
+		return fmt.Sprintf("%s: %s", errCode, errDesc)
+	}
+	return errCode
+}
+
 func (cs *CallbackServer) handleCallback(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
 		writePlainError(w, "method not allowed", http.StatusMethodNotAllowed)
 		flushResponse(w)
-		cs.sendResult(CallbackResult{Err: fmt.Errorf("method not allowed: %s", r.Method)})
 		return
 	}
 
-	code := r.URL.Query().Get("code")
-	if code == "" {
-		errMsg := r.URL.Query().Get("error")
-		errDesc := r.URL.Query().Get("error_description")
-		if errMsg == "" {
-			errMsg = "no authorization code received"
-		}
-		if errDesc != "" {
-			errMsg = fmt.Sprintf("%s: %s", errMsg, errDesc)
-		}
+	query := r.URL.Query()
+
+	// Validate state parameter first to prevent CSRF and local denial-of-service
+	// attacks before inspecting error or code parameters. expectedState is set at
+	// construction before Serve() begins, so no synchronization is required.
+	// Missing or mismatched state responds 403 without calling sendResult so an
+	// unauthenticated local request cannot abort an in-progress login.
+	if cs.expectedState != "" && !stateMatches(query.Get("state"), cs.expectedState) {
+		errMsg := "state parameter mismatch (possible CSRF attack)"
+		cs.writeErrorPage(w, http.StatusForbidden, html.EscapeString(errMsg))
+		flushResponse(w)
+		return
+	}
+
+	if rawErr := query.Get("error"); rawErr != "" {
+		errMsg := formatOAuthError(rawErr, query.Get("error_description"))
 		cs.writeErrorPage(w, http.StatusBadRequest, html.EscapeString(errMsg))
 		flushResponse(w)
 		cs.sendResult(CallbackResult{Err: fmt.Errorf("OAuth error: %s", errMsg)})
 		return
 	}
 
-	// Validate state parameter to prevent CSRF attacks.
-	// expectedState is set at construction before Serve() begins, so no
-	// synchronization is required.
-	if cs.expectedState != "" {
-		gotHash := sha256.Sum256([]byte(r.URL.Query().Get("state")))
-		expHash := sha256.Sum256([]byte(cs.expectedState))
-		if subtle.ConstantTimeCompare(gotHash[:], expHash[:]) != 1 {
-			errMsg := "state parameter mismatch (possible CSRF attack)"
-			cs.writeErrorPage(w, http.StatusForbidden, html.EscapeString(errMsg))
-			flushResponse(w)
-			cs.sendResult(CallbackResult{Err: fmt.Errorf("OAuth error: %s", errMsg)})
-			return
+	code := query.Get("code")
+	if code == "" {
+		errMsg := "no authorization code received"
+		if errDesc := sanitizeOAuthError(query.Get("error_description"), maxOAuthErrorDescRunes); errDesc != "" {
+			errMsg = fmt.Sprintf("%s: %s", errMsg, errDesc)
 		}
+		cs.writeErrorPage(w, http.StatusBadRequest, html.EscapeString(errMsg))
+		flushResponse(w)
+		cs.sendResult(CallbackResult{Err: fmt.Errorf("OAuth error: %s", errMsg)})
+		return
 	}
 
 	cs.completeSuccess(w, r, CallbackResult{Code: code})
@@ -416,9 +506,11 @@ func (cs *CallbackServer) handleCallback(w http.ResponseWriter, r *http.Request)
 // the server serves an HTML page with JavaScript that extracts the fragment
 // and POSTs the token back to a /token endpoint on the same server.
 //
-// If expectedState is non-empty, a provided state value must match it. Unlike
-// StartCallbackServer, the implicit flow accepts a missing state value and
-// only rejects explicit mismatches.
+// If expectedState is non-empty, the POSTed fragment parameters must include a
+// matching state value; requests with missing or mismatched state are rejected
+// with 403 without delivering a CallbackResult so forged local requests cannot
+// abort an in-progress login. Control characters in error and error_description
+// parameters are sanitized and length-capped before building CallbackResult.Err.
 //
 // Options allow configuring the callback host (default "localhost"), path
 // (default "/"), custom completion HTML (WithCallbackPages), and deferred
@@ -476,7 +568,9 @@ const maxImplicitTokenBody = 8192
 // implicit grant callback page.
 func (cs *CallbackServer) handleImplicitTokenPost(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
 		writePlainError(w, "method not allowed", http.StatusMethodNotAllowed)
+		flushResponse(w)
 		return
 	}
 
@@ -486,6 +580,7 @@ func (cs *CallbackServer) handleImplicitTokenPost(w http.ResponseWriter, r *http
 	// origin (scheme://host:port), not the full redirect URI which may include a path.
 	if origin := r.Header.Get("Origin"); origin != "" && origin != cs.origin {
 		writePlainError(w, "cross-origin request rejected", http.StatusForbidden)
+		flushResponse(w)
 		return
 	}
 
@@ -497,7 +592,6 @@ func (cs *CallbackServer) handleImplicitTokenPost(w http.ResponseWriter, r *http
 			writePlainError(w, "bad request", http.StatusBadRequest)
 		}
 		flushResponse(w)
-		cs.sendResult(CallbackResult{Err: fmt.Errorf("read implicit token POST: %w", err)})
 		return
 	}
 
@@ -509,43 +603,22 @@ func (cs *CallbackServer) handleImplicitTokenPost(w http.ResponseWriter, r *http
 			writePlainError(w, "bad request", http.StatusBadRequest)
 		}
 		flushResponse(w)
-		cs.sendResult(CallbackResult{Err: fmt.Errorf("parse implicit token POST: %w", err)})
 		return
 	}
 
-	// Validate state parameter first to reject CSRF before processing any payload.
-	// Some OAuth2 servers omit state from the implicit grant fragment.
-	// Per RFC 6749 section 4.2.2, state is only REQUIRED in the response if it was
-	// present in the request, but not all servers comply. Accept missing state (server
-	// didn't echo it back); reject only when the server returns a *different* state
-	// value.
-	//
-	// SECURITY NOTE: Accepting a missing state weakens CSRF protection. An attacker
-	// who can induce a redirect without a state parameter could potentially inject a
-	// token. Callers handling sensitive flows should prefer the authorization code
-	// grant (StartCallbackServer) which strictly rejects missing state.
-	if cs.expectedState != "" {
-		returnedState := params.Get("state")
-		if returnedState != "" {
-			gotHash := sha256.Sum256([]byte(returnedState))
-			expHash := sha256.Sum256([]byte(cs.expectedState))
-			if subtle.ConstantTimeCompare(gotHash[:], expHash[:]) != 1 {
-				errMsg := "state parameter mismatch (possible CSRF attack)"
-				cs.writeErrorPage(w, http.StatusForbidden, html.EscapeString(errMsg))
-				flushResponse(w)
-				cs.sendResult(CallbackResult{Err: fmt.Errorf("OAuth error: %s", errMsg)})
-				return
-			}
-		}
+	// Validate state parameter first in constant time before processing error or
+	// token parameters. Missing or mismatched state responds 403 without calling
+	// sendResult so a stray or forged local POST cannot abort an active login.
+	if cs.expectedState != "" && !stateMatches(params.Get("state"), cs.expectedState) {
+		errMsg := "state parameter mismatch (possible CSRF attack)"
+		cs.writeErrorPage(w, http.StatusForbidden, html.EscapeString(errMsg))
+		flushResponse(w)
+		return
 	}
 
-	// Check for OAuth error in fragment
-	if errCode := params.Get("error"); errCode != "" {
-		errDesc := params.Get("error_description")
-		errMsg := errCode
-		if errDesc != "" {
-			errMsg = fmt.Sprintf("%s: %s", errCode, errDesc)
-		}
+	// Check for OAuth error in fragment.
+	if rawErr := params.Get("error"); rawErr != "" {
+		errMsg := formatOAuthError(rawErr, params.Get("error_description"))
 		cs.writeErrorPage(w, http.StatusBadRequest, html.EscapeString(errMsg))
 		flushResponse(w)
 		cs.sendResult(CallbackResult{Err: fmt.Errorf("OAuth error: %s", errMsg)})
