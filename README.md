@@ -6,7 +6,10 @@ auth handler plugins.
 ## Features
 
 - **PKCE** -- RFC 7636 code verifier/challenge generation (S256)
-- **Browser launch** -- Cross-platform `open`/`xdg-open`/`rundll32` wrapper
+- **Browser launch** -- Configurable browser selection (`OpenBrowserWithPreference`,
+  `$BROWSER`, `WithWarningHandler`) with cross-platform discovery, graceful
+  system-default fallback (`open`/`xdg-open`/`rundll32`), URL hardening, and
+  detached process lifecycle
 - **Callback server** -- Local HTTP server for OAuth authorization code and
   implicit grant flows with CSRF state validation, IPv6 support, configurable
   host/path, and CORS origin checks
@@ -32,8 +35,15 @@ import "github.com/oakwood-commons/oauth-helpers"
 verifier, _ := oauth.GenerateCodeVerifier()
 challenge := oauth.GenerateCodeChallenge(verifier)
 
-// Browser
-oauth.OpenBrowser(ctx, authURL)
+// Browser (system default or $BROWSER)
+_ = oauth.OpenBrowser(ctx, authURL)
+
+// Browser with explicit preference and graceful fallback warning
+_ = oauth.OpenBrowserWithPreference(ctx, authURL, "msedge",
+    oauth.WithWarningHandler(func(msg string) {
+        log.Printf("warning: %s", msg)
+    }),
+)
 
 // Callback server (authorization code flow)
 cs, _ := oauth.StartCallbackServer(ctx, 0, state,
@@ -52,6 +62,29 @@ result := <-cs.ResultChan()
 cs.Complete(true)
 _ = cs.Shutdown(context.Background())
 ~~~
+
+### Browser Selection and Fallback
+
+- **Priority chain (`OpenBrowserWithPreference`)**:
+  1. Explicit `preference` (`"msedge"`/`"edge"`, `"chrome"`/`"google-chrome"`,
+     `"chromium"`, `"firefox"`, `"brave"`, `"safari"`, `"default"`/`"system"`,
+     or an executable name/path). `"default"` and `"system"` bypass `$BROWSER`
+     and open the OS default browser directly.
+  2. `$BROWSER` environment variable when `preference` is empty (`""`),
+     supporting colon-separated fallback lists on Unix (`firefox:chromium`) and
+     semicolon-separated entries or executable paths on Windows without ever
+     invoking a shell (`sh -c` or `cmd.exe /c`).
+  3. OS default browser (`open` on macOS, `xdg-open` on Linux,
+     `rundll32 url.dll,FileProtocolHandler` on Windows).
+- **Graceful fallback (`WithWarningHandler`)**: If the configured `preference`
+  or `$BROWSER` cannot be found or fails to start, `WithWarningHandler` receives
+  a human-readable warning and execution falls back to the OS default browser,
+  returning an error only when the fallback also fails (or if `ctx.Err()` / URL
+  validation fails up front).
+- **Security & detached lifecycle**: Validates `http://` / `https://` scheme
+  (case-insensitive), non-empty host, and absence of control characters or
+  whitespace before launch, and detaches spawned browser processes from `ctx` so
+  completing `Login(ctx)` does not terminate the user's browser session.
 
 ### Callback Pages and Deferred Completion
 

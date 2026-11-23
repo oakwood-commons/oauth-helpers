@@ -31,8 +31,12 @@ if err != nil {
 defer cs.Close()
 
 // cs.RedirectURI contains the callback URL (e.g., http://localhost:12345)
-// Build the authorization URL and open it
-oauth.OpenBrowser(ctx, authURL)
+// Build the authorization URL and open it (optionally targeting a preferred browser)
+_ = oauth.OpenBrowserWithPreference(ctx, authURL, browserPref,
+    oauth.WithWarningHandler(func(msg string) {
+        logger.Warn(msg)
+    }),
+)
 
 // Wait for the callback
 result := <-cs.ResultChan()
@@ -107,7 +111,10 @@ if result.Err != nil {
 ## Security Constraints
 
 - Callback servers bind **only** to loopback addresses (`localhost`, `127.0.0.1`, `::1`)
-- `OpenBrowser` only accepts `http://` and `https://` URLs
+- `OpenBrowser` and `OpenBrowserWithPreference` only accept `http://` and `https://`
+  URLs with a non-empty host and no control characters or whitespace, never invoke
+  `sh -c` or `cmd.exe /c`, and launch browser binaries detached from `ctx` so
+  canceling the login context does not kill the user's browser session
 - State parameter comparison runs **first** (before `error` or `code` handling) using
   **constant-time** comparison (`crypto/subtle`); missing or mismatched `state`
   and disallowed HTTP methods return `403`/`405` without delivering a `CallbackResult`

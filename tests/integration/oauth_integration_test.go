@@ -324,6 +324,45 @@ func TestIntegration_OpenBrowser_SchemeValidation(t *testing.T) {
 	}
 }
 
+// TestIntegration_OpenBrowserWithPreference_Validation verifies URL hardening
+// (empty host, whitespace, ASCII control characters) and pre-canceled context
+// handling without opening a real browser.
+func TestIntegration_OpenBrowserWithPreference_Validation(t *testing.T) {
+	ctx := context.Background()
+
+	invalidURLs := []struct {
+		name        string
+		rawURL      string
+		errContains string
+	}{
+		{"empty host rejected", "https:///callback", "empty host"},
+		{"whitespace rejected", "https://example.com/auth?a=1 b=2", "control characters or whitespace"},
+		{"newline rejected", "https://example.com/auth\n", "control characters or whitespace"},
+		{"DEL rejected", "https://example.com/auth\x7f", "control characters or whitespace"},
+	}
+
+	for _, tt := range invalidURLs {
+		t.Run(tt.name, func(t *testing.T) {
+			var warned bool
+			err := oauth.OpenBrowserWithPreference(
+				ctx,
+				tt.rawURL,
+				"msedge",
+				oauth.WithWarningHandler(func(string) { warned = true }),
+			)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.errContains)
+			assert.False(t, warned, "URL validation failure must fail up front without warning/fallback")
+		})
+	}
+
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := oauth.OpenBrowserWithPreference(canceledCtx, "HTTPS://example.com/authorize?a=1&b=2", "msedge")
+	require.Error(t, err)
+	assert.ErrorIs(t, err, context.Canceled)
+}
+
 // TestIntegration_ValidateCallbackHostPath tests the config-time validation
 // function for host and path combinations.
 func TestIntegration_ValidateCallbackHostPath(t *testing.T) {
