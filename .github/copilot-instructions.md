@@ -7,7 +7,7 @@ Go library providing shared OAuth 2.0 utilities: PKCE code generation, browser l
 
 - **PKCE**: Use `GenerateCodeVerifier()` and `GenerateCodeChallenge(verifier)` for RFC 7636 compliance
 - **Callback servers**: `StartCallbackServer()` for authorization code flow, `StartImplicitCallbackServer()` for implicit grant flow
-- **Browser**: `OpenBrowser()` launches URLs in the default browser (http/https only)
+- **Browser**: `OpenBrowser()` and `OpenBrowserWithPreference()` launch validated `http`/`https` URLs with configurable browser selection (`$BROWSER`, `WithWarningHandler`) and detached process lifecycle
 - **Stdlib only**: This module has zero non-test dependencies to minimize transitive overhead
 
 ## Conventions
@@ -37,7 +37,7 @@ The project uses `task` (go-task/task) for builds and linting. **Always use `tas
 ## Critical Rules
 
 - **Stdlib only**: This is a dependency-free library (test deps excluded). Never add runtime dependencies
-- **Security**: All callback servers bind only to loopback addresses. OpenBrowser only accepts http/https URLs
+- **Security**: All callback servers bind only to loopback addresses. `OpenBrowser` and `OpenBrowserWithPreference` only accept `http`/`https` URLs
 - **After any change**: Run `go test -race ./...` to ensure everything passes
 - **Test coverage**: Every new or changed file must have tests. Target 70%+ patch coverage
 - **Git safety**: Never run `git commit`, `git push`, or `git commit --amend` unless the user explicitly asks
