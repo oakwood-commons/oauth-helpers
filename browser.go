@@ -100,6 +100,31 @@ func withBrowserOps(ops *browserOps) BrowserOption {
 	}
 }
 
+func (ops *browserOps) startDetached(ctx context.Context, name string, args ...string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return ops.startCmd(name, args...)
+}
+
+func (ops *browserOps) startDefault(ctx context.Context, name string, args ...string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	starter := ops.startDefaultCmd
+	if starter == nil {
+		starter = ops.startCmd
+	}
+	return starter(name, args...)
+}
+
+func (ops *browserOps) run(ctx context.Context, name string, args ...string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return ops.runCmd(ctx, name, args...)
+}
+
 func defaultBrowserOps() browserOps {
 	return browserOps{
 		goos:            runtime.GOOS,
@@ -221,7 +246,7 @@ func OpenBrowserWithPreference(ctx context.Context, rawURL, preference string, o
 	pref := cleanBrowserToken(preference)
 	if pref != "" {
 		if isSystemDefaultPreference(pref) {
-			return launchSystemDefaultBrowser(&ops, normalizedURL)
+			return launchSystemDefaultBrowser(ctx, &ops, normalizedURL)
 		}
 		launchErr := launchPreferredBrowser(ctx, &ops, pref, normalizedURL)
 		if launchErr == nil {
@@ -231,7 +256,13 @@ func OpenBrowserWithPreference(ctx context.Context, rawURL, preference string, o
 			return fmt.Errorf("browser launch canceled: %w", ctxErr)
 		}
 		cfg.emitWarning(fmt.Sprintf("configured browser %q could not be launched (%v); falling back to system default browser", pref, launchErr))
-		if fallbackErr := launchSystemDefaultBrowser(&ops, normalizedURL); fallbackErr != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return fmt.Errorf("browser launch canceled: %w", ctxErr)
+		}
+		if fallbackErr := launchSystemDefaultBrowser(ctx, &ops, normalizedURL); fallbackErr != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return fmt.Errorf("browser launch canceled: %w", ctxErr)
+			}
 			return fmt.Errorf("failed to open system default browser after %q failed: %w", pref, fallbackErr)
 		}
 		return nil
@@ -244,14 +275,14 @@ func OpenBrowserWithPreference(ctx context.Context, rawURL, preference string, o
 	if rawBrowserEnv != "" {
 		entries := splitBrowserEnv(ops.goos, rawBrowserEnv)
 		if len(entries) == 1 && isSystemDefaultPreference(entries[0]) {
-			return launchSystemDefaultBrowser(&ops, normalizedURL)
+			return launchSystemDefaultBrowser(ctx, &ops, normalizedURL)
 		}
 		if len(entries) > 0 {
 			var lastErr error
 			for _, entry := range entries {
 				var entryErr error
 				if isSystemDefaultPreference(entry) {
-					entryErr = launchSystemDefaultBrowser(&ops, normalizedURL)
+					entryErr = launchSystemDefaultBrowser(ctx, &ops, normalizedURL)
 				} else {
 					entryErr = launchPreferredBrowser(ctx, &ops, entry, normalizedURL)
 				}
@@ -264,14 +295,20 @@ func OpenBrowserWithPreference(ctx context.Context, rawURL, preference string, o
 				lastErr = entryErr
 			}
 			cfg.emitWarning(fmt.Sprintf("$BROWSER (%q) could not be launched (%v); falling back to system default browser", rawBrowserEnv, lastErr))
-			if fallbackErr := launchSystemDefaultBrowser(&ops, normalizedURL); fallbackErr != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return fmt.Errorf("browser launch canceled: %w", ctxErr)
+			}
+			if fallbackErr := launchSystemDefaultBrowser(ctx, &ops, normalizedURL); fallbackErr != nil {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return fmt.Errorf("browser launch canceled: %w", ctxErr)
+				}
 				return fmt.Errorf("failed to open system default browser after $BROWSER (%q) failed: %w", rawBrowserEnv, fallbackErr)
 			}
 			return nil
 		}
 	}
 
-	return launchSystemDefaultBrowser(&ops, normalizedURL)
+	return launchSystemDefaultBrowser(ctx, &ops, normalizedURL)
 }
 
 func validateBrowserURL(rawURL string) (string, error) {
@@ -372,7 +409,7 @@ func resolveBrowserFamily(token string) browserFamily {
 	}
 }
 
-func launchSystemDefaultBrowser(ops *browserOps, rawURL string) error {
+func launchSystemDefaultBrowser(ctx context.Context, ops *browserOps, rawURL string) error {
 	var cmd string
 	var args []string
 
@@ -390,11 +427,10 @@ func launchSystemDefaultBrowser(ops *browserOps, rawURL string) error {
 		return fmt.Errorf("unsupported platform: %s", ops.goos)
 	}
 
-	starter := ops.startDefaultCmd
-	if starter == nil {
-		starter = ops.startCmd
-	}
-	if err := starter(cmd, args...); err != nil {
+	if err := ops.startDefault(ctx, cmd, args...); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return fmt.Errorf("browser launch canceled: %w", ctxErr)
+		}
 		return fmt.Errorf("starting default browser %q: %w", cmd, err)
 	}
 	return nil
@@ -411,9 +447,9 @@ func launchPreferredBrowser(ctx context.Context, ops *browserOps, token, rawURL 
 	case osDarwin:
 		return launchPreferredDarwin(ctx, ops, family, token, rawURL)
 	case osWindows:
-		return launchPreferredWindows(ops, family, token, rawURL)
+		return launchPreferredWindows(ctx, ops, family, token, rawURL)
 	case osLinux:
-		return launchPreferredLinux(ops, family, token, rawURL)
+		return launchPreferredLinux(ctx, ops, family, token, rawURL)
 	default:
 		return fmt.Errorf("unsupported platform: %s", ops.goos)
 	}
@@ -421,7 +457,7 @@ func launchPreferredBrowser(ctx context.Context, ops *browserOps, token, rawURL 
 
 func launchPreferredDarwin(ctx context.Context, ops *browserOps, family browserFamily, token, rawURL string) error {
 	if appName, ok := darwinAppName(family); ok {
-		if err := ops.runCmd(ctx, cmdOpen, macOSOpenAppFlag, appName, rawURL); err != nil {
+		if err := ops.run(ctx, cmdOpen, macOSOpenAppFlag, appName, rawURL); err != nil {
 			return fmt.Errorf("launching macOS application %q: %w", appName, err)
 		}
 		return nil
@@ -433,7 +469,7 @@ func launchPreferredDarwin(ctx context.Context, ops *browserOps, family browserF
 				return err
 			}
 		}
-		if err := ops.runCmd(ctx, cmdOpen, macOSOpenAppFlag, token, rawURL); err != nil {
+		if err := ops.run(ctx, cmdOpen, macOSOpenAppFlag, token, rawURL); err != nil {
 			return fmt.Errorf("launching macOS application %q: %w", token, err)
 		}
 		return nil
@@ -443,20 +479,20 @@ func launchPreferredDarwin(ctx context.Context, ops *browserOps, family browserF
 		if err := requireRegularFile(ops.stat, token); err != nil {
 			return err
 		}
-		if err := ops.startCmd(token, rawURL); err != nil {
+		if err := ops.startDetached(ctx, token, rawURL); err != nil {
 			return fmt.Errorf("starting browser executable %q: %w", token, err)
 		}
 		return nil
 	}
 
 	if bin, lookErr := ops.lookPath(token); lookErr == nil && bin != "" {
-		if err := ops.startCmd(bin, rawURL); err != nil {
+		if err := ops.startDetached(ctx, bin, rawURL); err != nil {
 			return fmt.Errorf("starting browser %q: %w", bin, err)
 		}
 		return nil
 	}
 
-	if err := ops.runCmd(ctx, cmdOpen, macOSOpenAppFlag, token, rawURL); err != nil {
+	if err := ops.run(ctx, cmdOpen, macOSOpenAppFlag, token, rawURL); err != nil {
 		return fmt.Errorf("launching browser %q on macOS: %w", token, err)
 	}
 	return nil
@@ -482,7 +518,7 @@ func darwinAppName(family browserFamily) (string, bool) {
 	return "", false
 }
 
-func launchPreferredWindows(ops *browserOps, family browserFamily, token, rawURL string) error {
+func launchPreferredWindows(ctx context.Context, ops *browserOps, family browserFamily, token, rawURL string) error {
 	if family == familySafari {
 		return errors.New("safari is not supported on windows")
 	}
@@ -490,7 +526,7 @@ func launchPreferredWindows(ops *browserOps, family browserFamily, token, rawURL
 	if exeNames, relPaths, ok := windowsCandidates(family); ok {
 		for _, name := range exeNames {
 			if bin, err := ops.lookPath(name); err == nil && bin != "" {
-				if startErr := ops.startCmd(bin, rawURL); startErr != nil {
+				if startErr := ops.startDetached(ctx, bin, rawURL); startErr != nil {
 					return fmt.Errorf("starting browser %q: %w", bin, startErr)
 				}
 				return nil
@@ -508,7 +544,7 @@ func launchPreferredWindows(ops *browserOps, family browserFamily, token, rawURL
 			for _, rel := range relPaths {
 				candidate := joinWindowsPath(root, rel...)
 				if fileExists(ops.stat, candidate) {
-					if startErr := ops.startCmd(candidate, rawURL); startErr != nil {
+					if startErr := ops.startDetached(ctx, candidate, rawURL); startErr != nil {
 						return fmt.Errorf("starting browser %q: %w", candidate, startErr)
 					}
 					return nil
@@ -523,7 +559,7 @@ func launchPreferredWindows(ops *browserOps, family browserFamily, token, rawURL
 		if err := requireRegularFile(ops.stat, token); err != nil {
 			return err
 		}
-		if err := ops.startCmd(token, rawURL); err != nil {
+		if err := ops.startDetached(ctx, token, rawURL); err != nil {
 			return fmt.Errorf("starting browser executable %q: %w", token, err)
 		}
 		return nil
@@ -535,7 +571,7 @@ func launchPreferredWindows(ops *browserOps, family browserFamily, token, rawURL
 	}
 	for _, cand := range candidates {
 		if bin, err := ops.lookPath(cand); err == nil && bin != "" {
-			if startErr := ops.startCmd(bin, rawURL); startErr != nil {
+			if startErr := ops.startDetached(ctx, bin, rawURL); startErr != nil {
 				return fmt.Errorf("starting browser %q: %w", bin, startErr)
 			}
 			return nil
@@ -576,26 +612,29 @@ func windowsCandidates(family browserFamily) ([]string, [][]string, bool) {
 	return nil, nil, false
 }
 
-func launchPreferredLinux(ops *browserOps, family browserFamily, token, rawURL string) error {
+func launchPreferredLinux(ctx context.Context, ops *browserOps, family browserFamily, token, rawURL string) error {
 	if family == familySafari {
 		return errors.New("safari is not supported on linux")
 	}
 
 	if binNames, wslExeNames, wslPaths, ok := linuxCandidates(family); ok {
-		for _, name := range binNames {
-			if bin, err := ops.lookPath(name); err == nil && bin != "" {
-				if startErr := ops.startCmd(bin, rawURL); startErr != nil {
-					return fmt.Errorf("starting browser %q: %w", bin, startErr)
+		hasExeSuffix := strings.HasSuffix(strings.ToLower(token), windowsExeSuffix)
+		if !hasExeSuffix {
+			for _, name := range binNames {
+				if bin, err := ops.lookPath(name); err == nil && bin != "" {
+					if startErr := ops.startDetached(ctx, bin, rawURL); startErr != nil {
+						return fmt.Errorf("starting browser %q: %w", bin, startErr)
+					}
+					return nil
 				}
-				return nil
 			}
 		}
 
 		wsl := isWSL(ops.getenv)
-		if wsl || strings.HasSuffix(strings.ToLower(token), windowsExeSuffix) {
+		if wsl || hasExeSuffix {
 			for _, exeName := range wslExeNames {
 				if bin, err := ops.lookPath(exeName); err == nil && bin != "" {
-					if startErr := ops.startCmd(bin, rawURL); startErr != nil {
+					if startErr := ops.startDetached(ctx, bin, rawURL); startErr != nil {
 						return fmt.Errorf("starting WSL browser %q: %w", bin, startErr)
 					}
 					return nil
@@ -606,7 +645,7 @@ func launchPreferredLinux(ops *browserOps, family browserFamily, token, rawURL s
 		if wsl {
 			for _, wslPath := range wslPaths {
 				if fileExists(ops.stat, wslPath) {
-					if startErr := ops.startCmd(wslPath, rawURL); startErr != nil {
+					if startErr := ops.startDetached(ctx, wslPath, rawURL); startErr != nil {
 						return fmt.Errorf("starting WSL browser %q: %w", wslPath, startErr)
 					}
 					return nil
@@ -621,7 +660,7 @@ func launchPreferredLinux(ops *browserOps, family browserFamily, token, rawURL s
 		if err := requireRegularFile(ops.stat, token); err != nil {
 			return err
 		}
-		if err := ops.startCmd(token, rawURL); err != nil {
+		if err := ops.startDetached(ctx, token, rawURL); err != nil {
 			return fmt.Errorf("starting browser executable %q: %w", token, err)
 		}
 		return nil
@@ -631,7 +670,7 @@ func launchPreferredLinux(ops *browserOps, family browserFamily, token, rawURL s
 	if err != nil {
 		return fmt.Errorf("browser %q not found on PATH: %w", token, err)
 	}
-	if startErr := ops.startCmd(bin, rawURL); startErr != nil {
+	if startErr := ops.startDetached(ctx, bin, rawURL); startErr != nil {
 		return fmt.Errorf("starting browser %q: %w", bin, startErr)
 	}
 	return nil
@@ -661,6 +700,8 @@ func linuxCandidates(family browserFamily) ([]string, []string, []string, bool) 
 			[]string{
 				"/mnt/c/Program Files/Chromium/Application/chrome.exe",
 				"/mnt/c/Program Files (x86)/Chromium/Application/chrome.exe",
+				"/mnt/c/Program Files/Chromium/Application/chromium.exe",
+				"/mnt/c/Program Files (x86)/Chromium/Application/chromium.exe",
 			},
 			true
 	case familyFirefox:

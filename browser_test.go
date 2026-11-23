@@ -678,6 +678,106 @@ func TestOpenBrowserWithPreference_LinuxAndWSL(t *testing.T) {
 		}, mock.calls[0])
 	})
 
+	t.Run("WSL explicit .exe aliases skip native Linux binaries when both exist", func(t *testing.T) {
+		cases := []struct {
+			pref      string
+			nativeBin string
+			nativeExe string
+			winExe    string
+			wslPath   string
+		}{
+			{
+				pref:      "msedge.exe",
+				nativeBin: "microsoft-edge",
+				nativeExe: "/usr/bin/microsoft-edge",
+				winExe:    "msedge.exe",
+				wslPath:   "/mnt/c/Program Files (x86)/Microsoft/Edge/Application/msedge.exe",
+			},
+			{
+				pref:      "chrome.exe",
+				nativeBin: "google-chrome",
+				nativeExe: "/usr/bin/google-chrome",
+				winExe:    "chrome.exe",
+				wslPath:   "/mnt/c/Program Files/Google/Chrome/Application/chrome.exe",
+			},
+			{
+				pref:      "chromium.exe",
+				nativeBin: "chromium",
+				nativeExe: "/usr/bin/chromium",
+				winExe:    "chromium.exe",
+				wslPath:   "/mnt/c/Program Files/Chromium/Application/chromium.exe",
+			},
+			{
+				pref:      "firefox.exe",
+				nativeBin: "firefox",
+				nativeExe: "/usr/bin/firefox",
+				winExe:    "firefox.exe",
+				wslPath:   "/mnt/c/Program Files/Mozilla Firefox/firefox.exe",
+			},
+			{
+				pref:      "BRAVE.EXE",
+				nativeBin: "brave-browser",
+				nativeExe: "/usr/bin/brave-browser",
+				winExe:    "brave.exe",
+				wslPath:   "/mnt/c/Program Files/BraveSoftware/Brave-Browser/Application/brave.exe",
+			},
+		}
+
+		for _, tc := range cases {
+			t.Run("PATH_"+tc.pref, func(t *testing.T) {
+				mock := newMockBrowserEnv(osLinux)
+				mock.env["WSL_DISTRO_NAME"] = "Ubuntu"
+				mock.pathBins[tc.nativeBin] = tc.nativeExe
+				mock.pathBins[tc.winExe] = "/mnt/c/bin/" + tc.winExe
+
+				err := OpenBrowserWithPreference(context.Background(), authURL, tc.pref, withBrowserOps(mock.ops()))
+				require.NoError(t, err)
+				require.Len(t, mock.calls, 1)
+				assert.Equal(t, "/mnt/c/bin/"+tc.winExe, mock.calls[0].name)
+			})
+
+			t.Run("mnt_c_"+tc.pref, func(t *testing.T) {
+				mock := newMockBrowserEnv(osLinux)
+				mock.env["WSL_DISTRO_NAME"] = "Ubuntu"
+				mock.pathBins[tc.nativeBin] = tc.nativeExe
+				mock.files[tc.wslPath] = fakeFileInfo{name: tc.winExe}
+
+				err := OpenBrowserWithPreference(context.Background(), authURL, tc.pref, withBrowserOps(mock.ops()))
+				require.NoError(t, err)
+				require.Len(t, mock.calls, 1)
+				assert.Equal(t, tc.wslPath, mock.calls[0].name)
+			})
+		}
+
+		// Generic family name without .exe retains native-first discovery on WSL.
+		mockGeneric := newMockBrowserEnv(osLinux)
+		mockGeneric.env["WSL_DISTRO_NAME"] = "Ubuntu"
+		mockGeneric.pathBins["firefox"] = "/usr/bin/firefox"
+		mockGeneric.pathBins["firefox.exe"] = "/mnt/c/Program Files/Mozilla Firefox/firefox.exe"
+		require.NoError(t, OpenBrowserWithPreference(context.Background(), authURL, "firefox", withBrowserOps(mockGeneric.ops())))
+		require.Len(t, mockGeneric.calls, 1)
+		assert.Equal(t, "/usr/bin/firefox", mockGeneric.calls[0].name)
+
+		// $BROWSER="firefox.exe" on WSL launches Windows firefox.exe even when /usr/bin/firefox exists.
+		mockEnv := newMockBrowserEnv(osLinux)
+		mockEnv.env["WSL_DISTRO_NAME"] = "Ubuntu"
+		mockEnv.env["BROWSER"] = "firefox.exe"
+		mockEnv.pathBins["firefox"] = "/usr/bin/firefox"
+		mockEnv.files["/mnt/c/Program Files/Mozilla Firefox/firefox.exe"] = fakeFileInfo{name: "firefox.exe"}
+		require.NoError(t, OpenBrowserWithPreference(context.Background(), authURL, "", withBrowserOps(mockEnv.ops())))
+		require.Len(t, mockEnv.calls, 1)
+		assert.Equal(t, "/mnt/c/Program Files/Mozilla Firefox/firefox.exe", mockEnv.calls[0].name)
+
+		// $BROWSER="firefox.exe:firefox" advances to native firefox when Windows firefox.exe is absent.
+		mockChain := newMockBrowserEnv(osLinux)
+		mockChain.env["WSL_DISTRO_NAME"] = "Ubuntu"
+		mockChain.env["BROWSER"] = "firefox.exe:firefox"
+		mockChain.pathBins["firefox"] = "/usr/bin/firefox"
+		require.NoError(t, OpenBrowserWithPreference(context.Background(), authURL, "", withBrowserOps(mockChain.ops())))
+		require.Len(t, mockChain.calls, 1)
+		assert.Equal(t, "/usr/bin/firefox", mockChain.calls[0].name)
+	})
+
 	t.Run("non-WSL linux ignores /mnt/c binaries and falls back to xdg-open", func(t *testing.T) {
 		mock := newMockBrowserEnv(osLinux)
 		wslEdge := "/mnt/c/Program Files (x86)/Microsoft/Edge/Application/msedge.exe"
@@ -979,6 +1079,109 @@ func TestOpenBrowserWithPreference_ErrorPathsAndTokenValidation(t *testing.T) {
 		err := OpenBrowserWithPreference(ctx, authURL, "msedge", withBrowserOps(ops))
 		require.ErrorIs(t, err, context.Canceled)
 		assert.Empty(t, mock.calls, "must not launch OS default after ctx cancel")
+	})
+
+	t.Run("context cancellation during discovery or warning handler prevents detached start", func(t *testing.T) {
+		// 1. Linux LookPath cancels ctx immediately before detached start.
+		t.Run("linux lookPath cancel", func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			mock := newMockBrowserEnv(osLinux)
+			ops := mock.ops()
+			ops.lookPath = func(file string) (string, error) {
+				if file == "firefox" {
+					cancel()
+					return "/usr/bin/firefox", nil
+				}
+				return "", errors.New("not found")
+			}
+			var warnings []string
+			err := OpenBrowserWithPreference(
+				ctx,
+				authURL,
+				"firefox",
+				WithWarningHandler(func(msg string) { warnings = append(warnings, msg) }),
+				withBrowserOps(ops),
+			)
+			require.ErrorIs(t, err, context.Canceled)
+			assert.Empty(t, mock.calls, "detached browser must not start when ctx canceled during lookPath")
+			assert.Empty(t, warnings)
+		})
+
+		// 2. Windows stat discovery cancels ctx immediately before detached start.
+		t.Run("windows stat discovery cancel", func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			mock := newMockBrowserEnv(osWindows)
+			mock.env["ProgramFiles"] = `C:\Program Files`
+			exe := `C:\Program Files\Mozilla Firefox\firefox.exe`
+			ops := mock.ops()
+			ops.stat = func(path string) (os.FileInfo, error) {
+				if path == exe {
+					cancel()
+					return fakeFileInfo{name: "firefox.exe"}, nil
+				}
+				return nil, os.ErrNotExist
+			}
+			err := OpenBrowserWithPreference(ctx, authURL, "firefox", withBrowserOps(ops))
+			require.ErrorIs(t, err, context.Canceled)
+			assert.Empty(t, mock.calls, "detached browser must not start when ctx canceled during stat")
+		})
+
+		// 3. Explicit preference fails, then warning handler cancels ctx before fallback start.
+		t.Run("preference warning handler cancel", func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			mock := newMockBrowserEnv(osLinux)
+			var warned bool
+			err := OpenBrowserWithPreference(
+				ctx,
+				authURL,
+				"missing-browser",
+				WithWarningHandler(func(string) {
+					warned = true
+					cancel()
+				}),
+				withBrowserOps(mock.ops()),
+			)
+			require.ErrorIs(t, err, context.Canceled)
+			assert.True(t, warned)
+			assert.Empty(t, mock.calls, "system default browser must not start when ctx canceled in warning handler")
+		})
+
+		// 4. $BROWSER fails, then warning handler cancels ctx before fallback start.
+		t.Run("BROWSER warning handler cancel", func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			mock := newMockBrowserEnv(osLinux)
+			mock.env["BROWSER"] = "missing-browser"
+			var warned bool
+			err := OpenBrowserWithPreference(
+				ctx,
+				authURL,
+				"",
+				WithWarningHandler(func(string) {
+					warned = true
+					cancel()
+				}),
+				withBrowserOps(mock.ops()),
+			)
+			require.ErrorIs(t, err, context.Canceled)
+			assert.True(t, warned)
+			assert.Empty(t, mock.calls, "system default browser must not start when ctx canceled in $BROWSER warning handler")
+		})
+
+		// 5. Direct launchSystemDefaultBrowser when ctx is already canceled or startDefaultCmd is nil.
+		t.Run("system default cancel and nil startDefaultCmd guard", func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			mock := newMockBrowserEnv(osLinux)
+			ops := mock.ops()
+			ops.startDefaultCmd = nil
+			require.NoError(t, launchSystemDefaultBrowser(ctx, ops, authURL))
+			require.Len(t, mock.calls, 1)
+			assert.Equal(t, "start", mock.calls[0].kind)
+
+			cancel()
+			err := launchSystemDefaultBrowser(ctx, ops, authURL)
+			require.ErrorIs(t, err, context.Canceled)
+			assert.Len(t, mock.calls, 1)
+		})
 	})
 
 	t.Run("windows error paths fall back cleanly", func(t *testing.T) {
