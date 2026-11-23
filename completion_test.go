@@ -297,28 +297,35 @@ func TestDeferredCompletion_InvalidCallbacksNeverShowSuccessOrProviderError(t *t
 	}
 
 	tests := []struct {
-		name       string
-		query      string
-		wantStatus int
-		wantErrSub string
+		name           string
+		query          string
+		wantStatus     int
+		wantErrSub     string
+		expectNoResult bool
 	}{
 		{
 			name:       "provider denial hides error_description in HTML",
-			query:      "/?error=access_denied&error_description=AADSTS65001+secret+detail",
+			query:      "/?error=access_denied&error_description=AADSTS65001+secret+detail&state=expected",
 			wantStatus: http.StatusBadRequest,
 			wantErrSub: "AADSTS65001 secret detail",
 		},
 		{
 			name:       "missing code",
-			query:      "/",
+			query:      "/?state=expected",
 			wantStatus: http.StatusBadRequest,
 			wantErrSub: "no authorization code received",
 		},
 		{
-			name:       "state mismatch",
-			query:      "/?code=abc&state=wrong",
-			wantStatus: http.StatusForbidden,
-			wantErrSub: "state parameter mismatch",
+			name:           "state mismatch",
+			query:          "/?code=abc&state=wrong",
+			wantStatus:     http.StatusForbidden,
+			expectNoResult: true,
+		},
+		{
+			name:           "error with missing state returns 403 without result",
+			query:          "/?error=access_denied&error_description=AADSTS65001+secret+detail",
+			wantStatus:     http.StatusForbidden,
+			expectNoResult: true,
 		},
 	}
 
@@ -343,6 +350,15 @@ func TestDeferredCompletion_InvalidCallbacksNeverShowSuccessOrProviderError(t *t
 			assert.NotContains(t, string(body), "SECRET SUCCESS MARKER")
 			assert.NotContains(t, string(body), "AADSTS65001")
 			assert.Equal(t, finalPageCSP, resp.Header.Get("Content-Security-Policy"))
+
+			if tt.expectNoResult {
+				select {
+				case res := <-cs.ResultChan():
+					t.Fatalf("expected no CallbackResult on state failure, got: %+v", res)
+				default:
+				}
+				return
+			}
 
 			res := <-cs.ResultChan()
 			require.Error(t, res.Err)
@@ -571,7 +587,7 @@ func TestDeferredCompletion_DefaultFailureOnInvalidCallbacksAndImplicitMissingTo
 		require.NoError(t, err)
 		defer cs.Close()
 
-		resp, err := http.Get(cs.RedirectURI + "/?error=access_denied&error_description=secret") //nolint:noctx // test code
+		resp, err := http.Get(cs.RedirectURI + "/?error=access_denied&error_description=secret&state=st") //nolint:noctx // test code
 		require.NoError(t, err)
 		defer resp.Body.Close()
 
@@ -589,7 +605,7 @@ func TestDeferredCompletion_DefaultFailureOnInvalidCallbacksAndImplicitMissingTo
 		require.NoError(t, err)
 		defer cs.Close()
 
-		resp, err := http.Post(cs.RedirectURI+"/token", "application/x-www-form-urlencoded", strings.NewReader("token_type=Bearer")) //nolint:noctx // test code
+		resp, err := http.Post(cs.RedirectURI+"/token", "application/x-www-form-urlencoded", strings.NewReader("token_type=Bearer&state=st")) //nolint:noctx // test code
 		require.NoError(t, err)
 		defer resp.Body.Close()
 
@@ -809,7 +825,7 @@ func TestWithCallbackPages_EmptyStructUsesEnhancedSafeFallbacks(t *testing.T) {
 		require.NoError(t, err)
 		defer cs.Close()
 
-		resp, err := http.Get(cs.RedirectURI + "/?error=access_denied&error_description=AADSTS99999+sensitive") //nolint:noctx // test code
+		resp, err := http.Get(cs.RedirectURI + "/?error=access_denied&error_description=AADSTS99999+sensitive&state=st") //nolint:noctx // test code
 		require.NoError(t, err)
 		defer resp.Body.Close()
 
@@ -966,14 +982,24 @@ func TestCallbackServer_ResponsesCarryFixedContentLengthAndSurviveImmediateClose
 		}
 	})
 
-	t.Run("legacy error and 405 plain error with immediate Close on ResultChan", func(t *testing.T) {
+	t.Run("legacy error, 403 state mismatch, and 405 plain error carry fixed Content-Length", func(t *testing.T) {
 		csErr, err := StartCallbackServer(context.Background(), 0, "st")
 		require.NoError(t, err)
+
+		// Missing state returns 403 with fixed Content-Length without poisoning ResultChan.
+		resp403, err := http.Get(csErr.RedirectURI + "/?error=access_denied") //nolint:noctx // test code
+		require.NoError(t, err)
+		body403, readErr := io.ReadAll(resp403.Body)
+		_ = resp403.Body.Close()
+		require.NoError(t, readErr)
+		assert.Equal(t, http.StatusForbidden, resp403.StatusCode)
+		assertFixedLength(t, resp403, body403)
+
 		go func() {
 			<-csErr.ResultChan()
 			_ = csErr.Close()
 		}()
-		respErr, err := http.Get(csErr.RedirectURI + "/?error=access_denied") //nolint:noctx // test code
+		respErr, err := http.Get(csErr.RedirectURI + "/?error=access_denied&state=st") //nolint:noctx // test code
 		require.NoError(t, err)
 		errBody, readErr := io.ReadAll(respErr.Body)
 		_ = respErr.Body.Close()
@@ -983,10 +1009,8 @@ func TestCallbackServer_ResponsesCarryFixedContentLengthAndSurviveImmediateClose
 
 		cs405, err := StartCallbackServer(context.Background(), 0, "st")
 		require.NoError(t, err)
-		go func() {
-			<-cs405.ResultChan()
-			_ = cs405.Close()
-		}()
+		defer cs405.Close()
+
 		resp405, err := http.Post(cs405.RedirectURI+"/", "text/plain", strings.NewReader("")) //nolint:noctx // test code
 		require.NoError(t, err)
 		body405, readErr := io.ReadAll(resp405.Body)
@@ -994,6 +1018,12 @@ func TestCallbackServer_ResponsesCarryFixedContentLengthAndSurviveImmediateClose
 		require.NoError(t, readErr)
 		assert.Equal(t, http.StatusMethodNotAllowed, resp405.StatusCode)
 		assertFixedLength(t, resp405, body405)
+
+		select {
+		case res := <-cs405.ResultChan():
+			t.Fatalf("405 must not send on ResultChan, got: %+v", res)
+		default:
+		}
 	})
 
 	t.Run("implicit bridge GET and token POST carry fixed Content-Length", func(t *testing.T) {
@@ -1007,6 +1037,15 @@ func TestCallbackServer_ResponsesCarryFixedContentLengthAndSurviveImmediateClose
 		require.NoError(t, readErr)
 		assert.Equal(t, implicitCallbackHTML, string(bridgeBody))
 		assertFixedLength(t, bridgeResp, bridgeBody)
+
+		getTokenResp, err := http.Get(cs.RedirectURI + "/token") //nolint:noctx // test code
+		require.NoError(t, err)
+		getTokenBody, readErr := io.ReadAll(getTokenResp.Body)
+		_ = getTokenResp.Body.Close()
+		require.NoError(t, readErr)
+		assert.Equal(t, http.StatusMethodNotAllowed, getTokenResp.StatusCode)
+		assert.Equal(t, http.MethodPost, getTokenResp.Header.Get("Allow"))
+		assertFixedLength(t, getTokenResp, getTokenBody)
 
 		go func() {
 			<-cs.ResultChan()

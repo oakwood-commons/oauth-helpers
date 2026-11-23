@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	oauth "github.com/oakwood-commons/oauth-helpers"
 	"github.com/stretchr/testify/assert"
@@ -65,8 +67,9 @@ func TestIntegration_AuthCodeFlow_Success(t *testing.T) {
 	}
 }
 
-// TestIntegration_AuthCodeFlow_CSRFRejection verifies that a mismatched state
-// parameter is rejected, preventing CSRF attacks.
+// TestIntegration_AuthCodeFlow_CSRFRejection verifies that missing or
+// mismatched state parameters on both error and code callbacks return 403
+// without terminating the wait for the legitimate redirect.
 func TestIntegration_AuthCodeFlow_CSRFRejection(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -75,33 +78,52 @@ func TestIntegration_AuthCodeFlow_CSRFRejection(t *testing.T) {
 	require.NoError(t, err)
 	defer cs.Close()
 
-	// Attacker sends a different state value
-	resp, err := http.Get(cs.RedirectURI + "/?code=stolen-code&state=attacker-state") //nolint:noctx // test code
-	require.NoError(t, err)
-	defer resp.Body.Close()
-	assert.Equal(t, http.StatusForbidden, resp.StatusCode)
+	// Forged error and code callbacks with missing or wrong state must return 403
+	// without poisoning ResultChan.
+	for _, forgedPath := range []string{
+		"/?error=access_denied",
+		"/?error=access_denied&state=attacker-state",
+		"/?code=stolen-code",
+		"/?code=stolen-code&state=attacker-state",
+	} {
+		resp, getErr := http.Get(cs.RedirectURI + forgedPath) //nolint:noctx // test code
+		require.NoError(t, getErr)
+		_ = resp.Body.Close()
+		assert.Equal(t, http.StatusForbidden, resp.StatusCode)
+	}
 
 	select {
 	case result := <-cs.ResultChan():
-		require.Error(t, result.Err)
-		assert.Contains(t, result.Err.Error(), "state parameter mismatch")
-		assert.Empty(t, result.Code)
+		t.Fatalf("forged callback must not terminate wait, got: %+v", result)
+	default:
+	}
+
+	// Real redirect with matching state succeeds.
+	resp, err := http.Get(cs.RedirectURI + "/?code=legitimate-code&state=legitimate-state") //nolint:noctx // test code
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+	select {
+	case result := <-cs.ResultChan():
+		require.NoError(t, result.Err)
+		assert.Equal(t, "legitimate-code", result.Code)
 	case <-ctx.Done():
 		t.Fatal("timed out waiting for callback result")
 	}
 }
 
 // TestIntegration_AuthCodeFlow_OAuthError simulates the identity provider
-// returning an error (e.g., user denied consent).
+// returning an error with matching state (e.g., user denied consent).
 func TestIntegration_AuthCodeFlow_OAuthError(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	cs, err := oauth.StartCallbackServer(ctx, 0, "")
+	cs, err := oauth.StartCallbackServer(ctx, 0, "err-state-123")
 	require.NoError(t, err)
 	defer cs.Close()
 
-	resp, err := http.Get(cs.RedirectURI + "/?error=consent_required&error_description=User+denied+access") //nolint:noctx // test code
+	resp, err := http.Get(cs.RedirectURI + "/?error=consent_required&error_description=User+denied+access&state=err-state-123") //nolint:noctx // test code
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
@@ -117,24 +139,35 @@ func TestIntegration_AuthCodeFlow_OAuthError(t *testing.T) {
 }
 
 // TestIntegration_AuthCodeFlow_MethodNotAllowed verifies that non-GET requests
-// to the callback endpoint are rejected.
+// to the callback endpoint return 405 without poisoning ResultChan.
 func TestIntegration_AuthCodeFlow_MethodNotAllowed(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	cs, err := oauth.StartCallbackServer(ctx, 0, "")
+	cs, err := oauth.StartCallbackServer(ctx, 0, "method-state")
 	require.NoError(t, err)
 	defer cs.Close()
 
-	resp, err := http.Post(cs.RedirectURI+"/?code=test", "text/plain", nil) //nolint:noctx // test code
+	resp, err := http.Post(cs.RedirectURI+"/?code=test&state=method-state", "text/plain", nil) //nolint:noctx // test code
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	assert.Equal(t, http.StatusMethodNotAllowed, resp.StatusCode)
 
 	select {
 	case result := <-cs.ResultChan():
-		require.Error(t, result.Err)
-		assert.Contains(t, result.Err.Error(), "method not allowed")
+		t.Fatalf("POST must not poison ResultChan, got: %+v", result)
+	default:
+	}
+
+	validResp, err := http.Get(cs.RedirectURI + "/?code=ok&state=method-state") //nolint:noctx // test code
+	require.NoError(t, err)
+	defer validResp.Body.Close()
+	assert.Equal(t, http.StatusOK, validResp.StatusCode)
+
+	select {
+	case result := <-cs.ResultChan():
+		require.NoError(t, result.Err)
+		assert.Equal(t, "ok", result.Code)
 	case <-ctx.Done():
 		t.Fatal("timed out waiting for callback result")
 	}
@@ -178,7 +211,8 @@ func TestIntegration_ImplicitFlow_Success(t *testing.T) {
 }
 
 // TestIntegration_ImplicitFlow_CSRFRejection verifies that the implicit flow
-// rejects mismatched state parameters.
+// rejects missing or mismatched state parameters with 403 without poisoning
+// ResultChan.
 func TestIntegration_ImplicitFlow_CSRFRejection(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -187,18 +221,35 @@ func TestIntegration_ImplicitFlow_CSRFRejection(t *testing.T) {
 	require.NoError(t, err)
 	defer cs.Close()
 
-	tokenData := "access_token=tok&token_type=Bearer&state=wrong-state"
-	resp, err := http.Post(cs.RedirectURI+"/token", "application/x-www-form-urlencoded", strings.NewReader(tokenData)) //nolint:noctx // test code
-	require.NoError(t, err)
-	defer resp.Body.Close()
-	assert.Equal(t, http.StatusForbidden, resp.StatusCode)
+	for _, forgedBody := range []string{
+		"access_token=tok&token_type=Bearer",
+		"access_token=tok&token_type=Bearer&state=wrong-state",
+		"error=access_denied&error_description=spoofed",
+		"error=access_denied&error_description=spoofed&state=wrong-state",
+	} {
+		resp, postErr := http.Post(cs.RedirectURI+"/token", "application/x-www-form-urlencoded", strings.NewReader(forgedBody)) //nolint:noctx // test code
+		require.NoError(t, postErr)
+		_ = resp.Body.Close()
+		assert.Equal(t, http.StatusForbidden, resp.StatusCode)
+	}
 
 	select {
 	case result := <-cs.ResultChan():
-		require.Error(t, result.Err)
-		assert.Contains(t, result.Err.Error(), "state parameter mismatch")
+		t.Fatalf("forged implicit POST must not poison ResultChan, got: %+v", result)
+	default:
+	}
+
+	validResp, err := http.Post(cs.RedirectURI+"/token", "application/x-www-form-urlencoded", strings.NewReader("access_token=valid-tok&token_type=Bearer&state=expected-implicit-state")) //nolint:noctx // test code
+	require.NoError(t, err)
+	defer validResp.Body.Close()
+	assert.Equal(t, http.StatusOK, validResp.StatusCode)
+
+	select {
+	case result := <-cs.ResultChan():
+		require.NoError(t, result.Err)
+		assert.Equal(t, "valid-tok", result.AccessToken)
 	case <-ctx.Done():
-		t.Fatal("timed out waiting for callback result")
+		t.Fatal("timed out waiting for valid implicit callback result")
 	}
 }
 
@@ -468,4 +519,59 @@ func TestIntegration_DeferredCompletion_FullLifecycle(t *testing.T) {
 	}
 
 	require.NoError(t, csFail.Shutdown(context.Background()))
+}
+
+// TestIntegration_ErrorControlCharAndLengthSanitization verifies end-to-end
+// sanitization of C0, DEL, C1, ANSI CSI, OSC, and overlong error fields in both
+// authorization-code and implicit callback servers.
+func TestIntegration_ErrorControlCharAndLengthSanitization(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	rawErr := "\x1b[31maccess_denied\x7f\u009b" + strings.Repeat("x", 200)
+	rawDesc := "\x1b]52;c;ZXY=\x07\x00\u009dFAKE\r\nLINE2 " + strings.Repeat("y", 600)
+
+	checkErr := func(t *testing.T, got error) {
+		t.Helper()
+		require.Error(t, got)
+		msg := got.Error()
+		assert.True(t, utf8.ValidString(msg))
+		assert.Contains(t, msg, "access_denied")
+		assert.Contains(t, msg, "FAKE LINE2")
+		assert.NotContains(t, msg, "\x1b")
+		for _, r := range msg {
+			assert.False(t, unicode.IsControl(r), "control rune %U must not appear in %q", r, msg)
+		}
+		assert.LessOrEqual(t, utf8.RuneCountInString(msg), len("OAuth error: ")+128+len(": ")+512)
+	}
+
+	csAuth, err := oauth.StartCallbackServer(ctx, 0, "int-san-state")
+	require.NoError(t, err)
+	defer csAuth.Close()
+
+	q := url.Values{
+		"state":             {"int-san-state"},
+		"error":             {rawErr},
+		"error_description": {rawDesc},
+	}
+	respAuth, err := http.Get(csAuth.RedirectURI + "/?" + q.Encode()) //nolint:noctx // test code
+	require.NoError(t, err)
+	_ = respAuth.Body.Close()
+	assert.Equal(t, http.StatusBadRequest, respAuth.StatusCode)
+	checkErr(t, (<-csAuth.ResultChan()).Err)
+
+	csImp, err := oauth.StartImplicitCallbackServer(ctx, 0, "int-imp-san-state")
+	require.NoError(t, err)
+	defer csImp.Close()
+
+	form := url.Values{
+		"state":             {"int-imp-san-state"},
+		"error":             {rawErr},
+		"error_description": {rawDesc},
+	}
+	respImp, err := http.Post(csImp.RedirectURI+"/token", "application/x-www-form-urlencoded", strings.NewReader(form.Encode())) //nolint:noctx // test code
+	require.NoError(t, err)
+	_ = respImp.Body.Close()
+	assert.Equal(t, http.StatusBadRequest, respImp.StatusCode)
+	checkErr(t, (<-csImp.ResultChan()).Err)
 }

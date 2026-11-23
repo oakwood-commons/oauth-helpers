@@ -8,9 +8,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -222,14 +225,26 @@ func TestCallbackServer_StateValidation_Mismatch(t *testing.T) {
 	resp, err := http.Get(cs.RedirectURI + "/?code=test-code&state=wrong-state") //nolint:noctx // test code
 	require.NoError(t, err)
 	defer resp.Body.Close()
+	assert.Equal(t, http.StatusForbidden, resp.StatusCode)
 
 	select {
 	case result := <-cs.ResultChan():
-		assert.Error(t, result.Err)
-		assert.Contains(t, result.Err.Error(), "state parameter mismatch")
-		assert.Empty(t, result.Code)
+		t.Fatalf("mismatched state must not deliver a CallbackResult, got: %+v", result)
+	default:
+	}
+
+	// Legitimate redirect afterwards still succeeds.
+	validResp, err := http.Get(cs.RedirectURI + "/?code=real-code&state=expected-state") //nolint:noctx // test code
+	require.NoError(t, err)
+	defer validResp.Body.Close()
+	assert.Equal(t, http.StatusOK, validResp.StatusCode)
+
+	select {
+	case result := <-cs.ResultChan():
+		require.NoError(t, result.Err)
+		assert.Equal(t, "real-code", result.Code)
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for callback result")
+		t.Fatal("timed out waiting for valid callback result")
 	}
 }
 
@@ -239,17 +254,128 @@ func TestCallbackServer_StateValidation_Missing(t *testing.T) {
 	require.NoError(t, err)
 	defer cs.Close()
 
-	// Code present but state missing from callback
+	// Code present but state missing from callback: rejected without terminating wait.
 	resp, err := http.Get(cs.RedirectURI + "/?code=test-code") //nolint:noctx // test code
 	require.NoError(t, err)
 	defer resp.Body.Close()
+	assert.Equal(t, http.StatusForbidden, resp.StatusCode)
 
 	select {
 	case result := <-cs.ResultChan():
-		assert.Error(t, result.Err)
-		assert.Contains(t, result.Err.Error(), "state parameter mismatch")
+		t.Fatalf("missing state must not deliver a CallbackResult, got: %+v", result)
+	default:
+	}
+
+	// Legitimate redirect afterwards still succeeds.
+	validResp, err := http.Get(cs.RedirectURI + "/?code=real-code&state=expected-state") //nolint:noctx // test code
+	require.NoError(t, err)
+	defer validResp.Body.Close()
+	assert.Equal(t, http.StatusOK, validResp.StatusCode)
+
+	select {
+	case result := <-cs.ResultChan():
+		require.NoError(t, result.Err)
+		assert.Equal(t, "real-code", result.Code)
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for callback result")
+		t.Fatal("timed out waiting for valid callback result")
+	}
+}
+
+func TestCallbackServer_ErrorAndNonGetGuardsDoNotPoisonResultChan(t *testing.T) {
+	ctx := context.Background()
+	cs, err := StartCallbackServer(ctx, 0, "secret-state")
+	require.NoError(t, err)
+	defer cs.Close()
+
+	// 1. Issue #17 repro: GET /?error=access_denied&error_description=%1b[31mFAKE with missing state.
+	respMissing, err := http.Get(cs.RedirectURI + "/?error=access_denied&error_description=%1b[31mFAKE") //nolint:noctx // test code
+	require.NoError(t, err)
+	_ = respMissing.Body.Close()
+	assert.Equal(t, http.StatusForbidden, respMissing.StatusCode)
+
+	// 2. GET /?error=access_denied with wrong state.
+	respWrong, err := http.Get(cs.RedirectURI + "/?error=access_denied&state=forged-state") //nolint:noctx // test code
+	require.NoError(t, err)
+	_ = respWrong.Body.Close()
+	assert.Equal(t, http.StatusForbidden, respWrong.StatusCode)
+
+	// 3. GET / with neither code nor state.
+	respBare, err := http.Get(cs.RedirectURI + "/") //nolint:noctx // test code
+	require.NoError(t, err)
+	_ = respBare.Body.Close()
+	assert.Equal(t, http.StatusForbidden, respBare.StatusCode)
+
+	// 4. POST / returns 405 Method Not Allowed without poisoning ResultChan.
+	respPost, err := http.Post(cs.RedirectURI+"/?error=access_denied&state=secret-state", "text/plain", strings.NewReader("body")) //nolint:noctx // test code
+	require.NoError(t, err)
+	postBody, err := io.ReadAll(respPost.Body)
+	_ = respPost.Body.Close()
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusMethodNotAllowed, respPost.StatusCode)
+	assert.Equal(t, http.MethodGet, respPost.Header.Get("Allow"))
+	assert.NotEmpty(t, respPost.Header.Get("Content-Length"))
+	assert.Contains(t, string(postBody), "method not allowed")
+
+	select {
+	case result := <-cs.ResultChan():
+		t.Fatalf("forged requests must not poison ResultChan, got: %+v", result)
+	default:
+	}
+
+	// 5. Subsequent valid redirect still completes the flow cleanly.
+	respOK, err := http.Get(cs.RedirectURI + "/?code=ok-after-attacks&state=secret-state") //nolint:noctx // test code
+	require.NoError(t, err)
+	_ = respOK.Body.Close()
+	assert.Equal(t, http.StatusOK, respOK.StatusCode)
+
+	select {
+	case result := <-cs.ResultChan():
+		require.NoError(t, result.Err)
+		assert.Equal(t, "ok-after-attacks", result.Code)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for valid callback result")
+	}
+}
+
+func TestCallbackServer_ErrorWithValidState_ReturnsError(t *testing.T) {
+	ctx := context.Background()
+	cs, err := StartCallbackServer(ctx, 0, "valid-state-xyz")
+	require.NoError(t, err)
+	defer cs.Close()
+
+	resp, err := http.Get(cs.RedirectURI + "/?error=access_denied&error_description=user+denied&state=valid-state-xyz") //nolint:noctx // test code
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+
+	select {
+	case result := <-cs.ResultChan():
+		require.Error(t, result.Err)
+		assert.Equal(t, "OAuth error: access_denied: user denied", result.Err.Error())
+		assert.Empty(t, result.Code)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for callback error result")
+	}
+}
+
+func TestCallbackServer_ErrorAndCodeTogether_PrioritizesError(t *testing.T) {
+	ctx := context.Background()
+	cs, err := StartCallbackServer(ctx, 0, "valid-state")
+	require.NoError(t, err)
+	defer cs.Close()
+
+	resp, err := http.Get(cs.RedirectURI + "/?error=server_error&code=ambiguous&state=valid-state") //nolint:noctx // test code
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+
+	select {
+	case result := <-cs.ResultChan():
+		require.Error(t, result.Err)
+		assert.Contains(t, result.Err.Error(), "server_error")
+		assert.Empty(t, result.Code)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for callback error result")
 	}
 }
 
@@ -405,37 +531,79 @@ func TestImplicitCallbackServer_StateValidation_Mismatch(t *testing.T) {
 	require.NoError(t, err)
 	defer cs.Close()
 
-	tokenData := "access_token=tok&token_type=Bearer&state=wrong-state"
-	resp, err := http.Post(cs.RedirectURI+"/token", "application/x-www-form-urlencoded", strings.NewReader(tokenData)) //nolint:noctx // test code
-	require.NoError(t, err)
-	defer resp.Body.Close()
-	assert.Equal(t, http.StatusForbidden, resp.StatusCode)
+	for _, payload := range []string{
+		"access_token=tok&token_type=Bearer&state=wrong-state",
+		"error=access_denied&error_description=spoofed&state=wrong-state",
+	} {
+		resp, postErr := http.Post(cs.RedirectURI+"/token", "application/x-www-form-urlencoded", strings.NewReader(payload)) //nolint:noctx // test code
+		require.NoError(t, postErr)
+		_ = resp.Body.Close()
+		assert.Equal(t, http.StatusForbidden, resp.StatusCode)
+	}
 
 	select {
 	case result := <-cs.ResultChan():
-		assert.Error(t, result.Err)
-		assert.Contains(t, result.Err.Error(), "state parameter mismatch")
+		t.Fatalf("mismatched implicit state must not poison ResultChan, got: %+v", result)
+	default:
+	}
+
+	validResp, err := http.Post(cs.RedirectURI+"/token", "application/x-www-form-urlencoded", strings.NewReader("access_token=real-tok&token_type=Bearer&state=expected-state")) //nolint:noctx // test code
+	require.NoError(t, err)
+	defer validResp.Body.Close()
+	assert.Equal(t, http.StatusOK, validResp.StatusCode)
+
+	select {
+	case result := <-cs.ResultChan():
+		require.NoError(t, result.Err)
+		assert.Equal(t, "real-tok", result.AccessToken)
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for callback result")
+		t.Fatal("timed out waiting for valid implicit callback result")
 	}
 }
 
-func TestImplicitCallbackServer_StateOmittedByServer(t *testing.T) {
+func TestImplicitCallbackServer_StateValidation_Missing(t *testing.T) {
 	ctx := context.Background()
 	cs, err := StartImplicitCallbackServer(ctx, 0, "my-state")
 	require.NoError(t, err)
 	defer cs.Close()
 
-	// Server omits state from fragment -- should be accepted per RFC 6749 section 4.2.2
-	tokenData := "access_token=tok&token_type=Bearer"
-	resp, err := http.Post(cs.RedirectURI+"/token", "application/x-www-form-urlencoded", strings.NewReader(tokenData)) //nolint:noctx // test code
+	// Missing state on both token and error payloads must return 403 without poisoning ResultChan.
+	for _, payload := range []string{
+		"access_token=tok&token_type=Bearer",
+		"error=access_denied&error_description=spoofed",
+	} {
+		resp, postErr := http.Post(cs.RedirectURI+"/token", "application/x-www-form-urlencoded", strings.NewReader(payload)) //nolint:noctx // test code
+		require.NoError(t, postErr)
+		_ = resp.Body.Close()
+		assert.Equal(t, http.StatusForbidden, resp.StatusCode)
+	}
+
+	// Non-POST and malformed body also must not poison ResultChan.
+	getResp, err := http.Get(cs.RedirectURI + "/token?access_token=tok&state=my-state") //nolint:noctx // test code
 	require.NoError(t, err)
-	defer resp.Body.Close()
-	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	_ = getResp.Body.Close()
+	assert.Equal(t, http.StatusMethodNotAllowed, getResp.StatusCode)
+	assert.Equal(t, http.MethodPost, getResp.Header.Get("Allow"))
+
+	badResp, err := http.Post(cs.RedirectURI+"/token", "application/x-www-form-urlencoded", strings.NewReader("%ZZ")) //nolint:noctx // test code
+	require.NoError(t, err)
+	_ = badResp.Body.Close()
+	assert.Equal(t, http.StatusBadRequest, badResp.StatusCode)
 
 	select {
 	case result := <-cs.ResultChan():
-		assert.NoError(t, result.Err)
+		t.Fatalf("unauthenticated implicit requests must not poison ResultChan, got: %+v", result)
+	default:
+	}
+
+	validResp, err := http.Post(cs.RedirectURI+"/token", "application/x-www-form-urlencoded", strings.NewReader("access_token=tok&token_type=Bearer&state=my-state")) //nolint:noctx // test code
+	require.NoError(t, err)
+	defer validResp.Body.Close()
+	assert.Equal(t, http.StatusOK, validResp.StatusCode)
+
+	select {
+	case result := <-cs.ResultChan():
+		require.NoError(t, result.Err)
 		assert.Equal(t, "tok", result.AccessToken)
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for callback result")
@@ -753,4 +921,199 @@ func TestValidateCallbackHostPath(t *testing.T) {
 			}
 		})
 	}
+}
+
+func assertNoControlRunes(t *testing.T, s string) {
+	t.Helper()
+	assert.True(t, utf8.ValidString(s), "sanitized string must be valid UTF-8: %q", s)
+	for i, r := range s {
+		assert.False(t, unicode.IsControl(r), "unexpected control rune %U at byte %d in %q", r, i, s)
+		assert.False(t, isDisallowedControlRune(r), "unexpected disallowed rune %U at byte %d in %q", r, i, s)
+	}
+}
+
+func TestSanitizeOAuthError(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		maxRunes int
+		want     string
+	}{
+		{
+			name:     "plain ASCII unchanged",
+			input:    "access_denied",
+			maxRunes: maxOAuthErrorRunes,
+			want:     "access_denied",
+		},
+		{
+			name:     "unicode text preserved",
+			input:    "accès refusé: 権限がありません",
+			maxRunes: maxOAuthErrorDescRunes,
+			want:     "accès refusé: 権限がありません",
+		},
+		{
+			name:     "empty or non-positive maxRunes",
+			input:    "access_denied",
+			maxRunes: 0,
+			want:     "",
+		},
+		{
+			name:     "ANSI CSI escape sequence stripped of ESC",
+			input:    "\x1b[31mFAKE ERROR\x1b[0m",
+			maxRunes: maxOAuthErrorDescRunes,
+			want:     "[31mFAKE ERROR[0m",
+		},
+		{
+			name:     "OSC 52 clipboard sequence stripped of ESC and BEL",
+			input:    "\x1b]52;c;Y3VybCBldmls\x07clipboard",
+			maxRunes: maxOAuthErrorDescRunes,
+			want:     "]52;c;Y3VybCBldmlsclipboard",
+		},
+		{
+			name:     "C0, DEL, C1 runes and all bidi control ranges removed",
+			input:    "a\x00b\x07c\x08d\x7fe\u0080f\u009bg\u009dh\u009fi\u061cj\u200ek\u200fl\u202am\u202en\u202co\u2066p\u2069q",
+			maxRunes: maxOAuthErrorDescRunes,
+			want:     "abcdefghijklmnopq",
+		},
+		{
+			name:     "raw invalid UTF-8 C1 bytes dropped",
+			input:    "bad\x9b31m\x80\x9ftext",
+			maxRunes: maxOAuthErrorDescRunes,
+			want:     "bad31mtext",
+		},
+		{
+			name:     "whitespace controls and repeated spaces normalized and trimmed",
+			input:    "\r\n\t  line one\r\n   line two\u2028line three\u2029\n  ",
+			maxRunes: maxOAuthErrorDescRunes,
+			want:     "line one line two line three",
+		},
+		{
+			name:     "leading spaces do not exhaust maxRunes budget",
+			input:    strings.Repeat(" ", 200) + "access_denied",
+			maxRunes: maxOAuthErrorRunes,
+			want:     "access_denied",
+		},
+		{
+			name:     "whitespace separator landing on maxRunes boundary does not emit trailing space",
+			input:    "ab\nc",
+			maxRunes: 3,
+			want:     "ab",
+		},
+		{
+			name:     "only control characters yields empty string",
+			input:    "\x00\x07\x1b\x7f\u0085\u009b\r\n\t",
+			maxRunes: maxOAuthErrorRunes,
+			want:     "",
+		},
+		{
+			name:     "overlong ASCII capped at maxRunes",
+			input:    strings.Repeat("x", 300),
+			maxRunes: maxOAuthErrorRunes,
+			want:     strings.Repeat("x", maxOAuthErrorRunes),
+		},
+		{
+			name:     "overlong multi-byte UTF-8 capped by rune count without splitting UTF-8",
+			input:    strings.Repeat("é", 700),
+			maxRunes: maxOAuthErrorDescRunes,
+			want:     strings.Repeat("é", maxOAuthErrorDescRunes),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := sanitizeOAuthError(tt.input, tt.maxRunes)
+			assert.Equal(t, tt.want, got)
+			assertNoControlRunes(t, got)
+			if tt.maxRunes > 0 {
+				assert.LessOrEqual(t, utf8.RuneCountInString(got), tt.maxRunes)
+			}
+		})
+	}
+
+	assert.Equal(t, "unknown_error: details", formatOAuthError("\x1b\x07", "details"))
+}
+
+func TestCallbackServers_SanitizeControlCharsAndCapLength(t *testing.T) {
+	maliciousErr := "\x1b[31maccess_denied\x7f\u009b\u202e" + strings.Repeat("E", 250)
+	maliciousDesc := "\x1b]52;c;cHduZWQ=\x07\x00\u009d\u2066line1\r\nline2 " + strings.Repeat("D", 700)
+
+	extractErrorDetail := func(t *testing.T, htmlDoc string) string {
+		t.Helper()
+		const startTag = `<p class="error-detail">`
+		_, after, ok := strings.Cut(htmlDoc, startTag)
+		require.True(t, ok, "expected %s in HTML response", startTag)
+		detail, _, ok := strings.Cut(after, "</p>")
+		require.True(t, ok, "expected closing </p> after error-detail")
+		return detail
+	}
+
+	t.Run("authorization code callback", func(t *testing.T) {
+		cs, err := StartCallbackServer(context.Background(), 0, "st-san")
+		require.NoError(t, err)
+		defer cs.Close()
+
+		q := url.Values{
+			"state":             {"st-san"},
+			"error":             {maliciousErr},
+			"error_description": {maliciousDesc},
+		}
+		resp, err := http.Get(cs.RedirectURI + "/?" + q.Encode()) //nolint:noctx // test code
+		require.NoError(t, err)
+		body, readErr := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		require.NoError(t, readErr)
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		assertNoControlRunes(t, extractErrorDetail(t, string(body)))
+
+		res := <-cs.ResultChan()
+		require.Error(t, res.Err)
+		assertNoControlRunes(t, res.Err.Error())
+		assert.NotContains(t, res.Err.Error(), "\x1b")
+		assert.LessOrEqual(t, utf8.RuneCountInString(res.Err.Error()), len("OAuth error: ")+maxOAuthErrorRunes+len(": ")+maxOAuthErrorDescRunes)
+	})
+
+	t.Run("authorization code missing code with control-char error_description", func(t *testing.T) {
+		cs, err := StartCallbackServer(context.Background(), 0, "st-nocode")
+		require.NoError(t, err)
+		defer cs.Close()
+
+		q := url.Values{
+			"state":             {"st-nocode"},
+			"error_description": {"\x1b[31mFAKE\x07"},
+		}
+		resp, err := http.Get(cs.RedirectURI + "/?" + q.Encode()) //nolint:noctx // test code
+		require.NoError(t, err)
+		_ = resp.Body.Close()
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+
+		res := <-cs.ResultChan()
+		require.Error(t, res.Err)
+		assertNoControlRunes(t, res.Err.Error())
+		assert.Equal(t, "OAuth error: no authorization code received: [31mFAKE", res.Err.Error())
+	})
+
+	t.Run("implicit token POST callback", func(t *testing.T) {
+		cs, err := StartImplicitCallbackServer(context.Background(), 0, "st-imp-san")
+		require.NoError(t, err)
+		defer cs.Close()
+
+		form := url.Values{
+			"state":             {"st-imp-san"},
+			"error":             {maliciousErr},
+			"error_description": {maliciousDesc},
+		}
+		resp, err := http.Post(cs.RedirectURI+"/token", "application/x-www-form-urlencoded", strings.NewReader(form.Encode())) //nolint:noctx // test code
+		require.NoError(t, err)
+		body, readErr := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		require.NoError(t, readErr)
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		assertNoControlRunes(t, extractErrorDetail(t, string(body)))
+
+		res := <-cs.ResultChan()
+		require.Error(t, res.Err)
+		assertNoControlRunes(t, res.Err.Error())
+		assert.NotContains(t, res.Err.Error(), "\x1b")
+		assert.LessOrEqual(t, utf8.RuneCountInString(res.Err.Error()), len("OAuth error: ")+maxOAuthErrorRunes+len(": ")+maxOAuthErrorDescRunes)
+	})
 }

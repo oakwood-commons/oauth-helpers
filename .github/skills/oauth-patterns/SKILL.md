@@ -108,7 +108,12 @@ if result.Err != nil {
 
 - Callback servers bind **only** to loopback addresses (`localhost`, `127.0.0.1`, `::1`)
 - `OpenBrowser` only accepts `http://` and `https://` URLs
-- State parameter comparison uses **constant-time** comparison (`crypto/subtle`)
+- State parameter comparison runs **first** (before `error` or `code` handling) using
+  **constant-time** comparison (`crypto/subtle`); missing or mismatched `state`
+  and disallowed HTTP methods return `403`/`405` without delivering a `CallbackResult`
+  so stray local requests cannot abort an active login
+- Untrusted `error` and `error_description` parameters strip C0, DEL, C1, and
+  bidirectional control characters and cap length before building `CallbackResult.Err`
 - Final and error HTML responses carry strict security headers (`Content-Security-Policy`,
   `X-Content-Type-Options: nosniff`, `Cache-Control: no-store`, `Referrer-Policy: no-referrer`)
 - Implicit bridge pages enforce a SHA-256 script-hash CSP and render final HTML
