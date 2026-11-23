@@ -51,3 +51,7 @@ go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 ## Additional Conventions
 
 Go coding conventions (error handling, testing patterns) are in `.github/instructions/*.instructions.md` files -- they load automatically when editing relevant files.
+
+<!-- copilot-review:start -->
+For pull request code review, follow the review contract in [`REVIEW.md`](../REVIEW.md) at the repo root. It is the single source of truth; do not duplicate it here.
+<!-- copilot-review:end -->
