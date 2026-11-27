@@ -6,6 +6,11 @@ auth handler plugins.
 ## Features
 
 - **PKCE** -- RFC 7636 code verifier/challenge generation (S256)
+- **Device authorization polling** -- Generic RFC 8628 token poller
+  (`PollDeviceToken`) with post-response wait spacing, configurable safety
+  margin, `slow_down` interval backoff, sentinel error wrapping
+  (`ErrDeviceCodeExpired`, `ErrDeviceAccessDenied`), and optional transient
+  error retry
 - **Browser launch** -- Configurable browser selection (`OpenBrowserWithPreference`,
   `$BROWSER`, `WithWarningHandler`) with cross-platform discovery, graceful
   system-default fallback (`open`/`xdg-open`/`rundll32`), URL hardening, and
@@ -35,6 +40,23 @@ import "github.com/oakwood-commons/oauth-helpers"
 verifier, _ := oauth.GenerateCodeVerifier()
 challenge := oauth.GenerateCodeChallenge(verifier)
 
+// Device authorization polling (RFC 8628)
+type TokenResponse struct {
+    AccessToken string `json:"access_token"`
+}
+tok, err := oauth.PollDeviceToken(ctx, oauth.DevicePollConfig{
+    Interval:             5 * time.Second,
+    RetryTransientErrors: true,
+}, func(ctx context.Context) (*TokenResponse, *oauth.DevicePollError, error) {
+    // Perform a single HTTP POST to the provider's token endpoint and map
+    // RFC 8628 error responses to *oauth.DevicePollError.
+    return exchangeOnce(ctx)
+})
+if errors.Is(err, oauth.ErrDeviceCodeExpired) || errors.Is(err, oauth.ErrDeviceAccessDenied) {
+    // Handle expired code or user denial
+}
+_ = tok
+
 // Browser (system default or $BROWSER)
 _ = oauth.OpenBrowser(ctx, authURL)
 
@@ -62,6 +84,31 @@ result := <-cs.ResultChan()
 cs.Complete(true)
 _ = cs.Shutdown(context.Background())
 ~~~
+
+### Device Authorization Polling
+
+- **Post-response spacing (`PollDeviceToken`)**: Waits `Interval + SafetyMargin`
+  before the first poll attempt and after each completed `authorization_pending`,
+  `slow_down`, or retried transient-error response rather than using a fixed-rate
+  ticker, preventing HTTP round-trip latency from shortening the server's
+  rate-limit window. When `RetryTransientErrors` is enabled, timeout errors
+  double the base polling interval (clamped on overflow) before retrying per
+  RFC 8628 Section 3.5 while non-timeout transient errors retain the current
+  interval.
+- **Defaults & safety margin (`DevicePollConfig`)**: Enforces a configurable
+  minimum interval (`MinInterval`, default `DefaultDevicePollInterval` = `5s`)
+  and post-response safety margin (`SafetyMargin`, default
+  `DefaultDevicePollSafetyMargin` = `1s`; set `DisableSafetyMargin: true` for an
+  exact `0s` margin).
+- **`slow_down` & error semantics (`DevicePollError`)**: Increases the base
+  interval to `max(serverInterval, interval + SlowDownIncrement)` (with
+  `SlowDownIncrement` clamped to at least `DefaultDeviceSlowDownIncrement` = `5s`
+  per RFC 8628 Section 3.5), wraps `ErrDeviceCodeExpired` on `expired_token` and
+  `ErrDeviceAccessDenied` on `access_denied` or `authorization_declined`, returns
+  `DevicePollError.Cause` directly on other error codes when set, sanitizes and
+  length-caps `Code`, `Description`, and formatted `Cause` text while preserving
+  the original `Cause` via `Unwrap`, and accepts an optional `Sleep` hook for
+  deterministic unit tests.
 
 ### Browser Selection and Fallback
 

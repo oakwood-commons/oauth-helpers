@@ -5,11 +5,12 @@ For pull request code review, follow the review contract in [`REVIEW.md`](../REV
 <!-- copilot-review:end -->
 
 ## Overview
-Go library providing shared OAuth 2.0 utilities: PKCE code generation, browser launching, and local callback servers for authorization code and implicit grant flows.
+Go library providing shared OAuth 2.0 utilities: PKCE code generation, RFC 8628 device-authorization token polling, browser launching, and local callback servers for authorization code and implicit grant flows.
 
 ## Key Patterns
 
 - **PKCE**: Use `GenerateCodeVerifier()` and `GenerateCodeChallenge(verifier)` for RFC 7636 compliance
+- **Device flow polling**: Use `PollDeviceToken()` with `DevicePollConfig` and `DevicePollError` for RFC 8628 token polling with post-response spacing and `slow_down` handling
 - **Callback servers**: `StartCallbackServer()` for authorization code flow, `StartImplicitCallbackServer()` for implicit grant flow
 - **Browser**: `OpenBrowser()` and `OpenBrowserWithPreference()` launch validated `http`/`https` URLs with configurable browser selection (`$BROWSER`, `WithWarningHandler`) and detached process lifecycle
 - **Stdlib only**: This module has zero non-test dependencies to minimize transitive overhead

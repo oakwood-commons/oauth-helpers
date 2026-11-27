@@ -1,5 +1,5 @@
 ---
-description: "OAuth 2.0 flow patterns for oauth-helpers: PKCE, authorization code, implicit grant, callback servers, custom pages, deferred completion, and browser launching."
+description: "OAuth 2.0 flow patterns for oauth-helpers: PKCE, RFC 8628 device authorization polling, authorization code, implicit grant, callback servers, custom pages, deferred completion, and browser launching."
 ---
 
 # OAuth Flow Patterns
@@ -18,6 +18,52 @@ challenge := oauth.GenerateCodeChallenge(verifier)
 
 - Verifier: 43-character base64url-encoded random string (32 bytes)
 - Challenge: S256 (SHA-256 hash of verifier, base64url-encoded)
+
+## Device Authorization Flow (RFC 8628)
+
+Poll a device-authorization token endpoint with post-response spacing and
+`slow_down` backoff:
+
+~~~go
+tok, err := oauth.PollDeviceToken(ctx, oauth.DevicePollConfig{
+    Interval:             time.Duration(deviceCode.Interval) * time.Second,
+    RetryTransientErrors: true,
+    OnSlowDown: func(newInterval time.Duration) {
+        logger.Info("slow_down received, increasing poll interval", "newInterval", newInterval)
+    },
+}, func(ctx context.Context) (*TokenResponse, *oauth.DevicePollError, error) {
+    resp, err := postDeviceToken(ctx)
+    if err != nil {
+        return nil, nil, err // retried after Interval + SafetyMargin when RetryTransientErrors is true
+    }
+    if resp.Error != "" {
+        return nil, &oauth.DevicePollError{
+            Code:        resp.Error,
+            Description: resp.ErrorDescription,
+            Interval:    resp.Interval,
+        }, nil
+    }
+    return resp, nil, nil
+})
+if errors.Is(err, oauth.ErrDeviceCodeExpired) {
+    return fmt.Errorf("device code expired: %w", err)
+}
+if errors.Is(err, oauth.ErrDeviceAccessDenied) {
+    return fmt.Errorf("user denied authorization: %w", err)
+}
+~~~
+
+- Waits `Interval + SafetyMargin` (default `5s` + `1s`) before the first poll
+  and after each completed `authorization_pending`, `slow_down`, or retried
+  transient-error response rather than using a fixed-rate ticker; when
+  `RetryTransientErrors` is enabled, timeout errors double the base interval
+  (clamped on overflow) before retrying per RFC 8628 Section 3.5 while
+  non-timeout transient errors leave the interval unchanged
+- Increases the base interval to `max(serverInterval, interval + SlowDownIncrement)`
+  (with `SlowDownIncrement` clamped to at least `5s`) on `slow_down`
+- Wraps `ErrDeviceCodeExpired` on `expired_token` and `ErrDeviceAccessDenied`
+  on `access_denied` or `authorization_declined`, while keeping `*DevicePollError`
+  and `Cause` inspectable via `errors.As` / `errors.Is`
 
 ## Authorization Code Flow
 
@@ -128,3 +174,7 @@ if result.Err != nil {
 - Custom `CallbackPages` slices are cloned defensively and served byte-for-byte;
   provider `error_description` strings are never interpolated into enhanced/custom
   failure pages, and legacy troubleshooting pages single-escape all untrusted input
+- `PollDeviceToken` schedules waits after each poll response completes (never on a
+  fixed-rate ticker), clamps untrusted `slow_down` intervals against duration
+  overflow, and sanitizes C0, DEL, C1, and bidirectional control characters with
+  rune-length caps in `DevicePollError` and sentinel-wrapped error strings
