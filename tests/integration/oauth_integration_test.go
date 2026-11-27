@@ -5,11 +5,14 @@ package integration_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode"
@@ -613,4 +616,183 @@ func TestIntegration_ErrorControlCharAndLengthSanitization(t *testing.T) {
 	_ = respImp.Body.Close()
 	assert.Equal(t, http.StatusBadRequest, respImp.StatusCode)
 	checkErr(t, (<-csImp.ResultChan()).Err)
+}
+
+// TestIntegration_DeviceCodeFlow_PollLifecycle exercises PollDeviceToken
+// end-to-end against a loopback HTTP token endpoint across authorization_pending,
+// slow_down with server-supplied interval, token issuance, expired_token, and
+// authorization_declined responses.
+func TestIntegration_DeviceCodeFlow_PollLifecycle(t *testing.T) {
+	type tokenPayload struct {
+		AccessToken string `json:"access_token"`
+		TokenType   string `json:"token_type"`
+		Error       string `json:"error"`
+		ErrorDesc   string `json:"error_description"`
+		Interval    int    `json:"interval"`
+	}
+
+	var reqCount atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch reqCount.Add(1) {
+		case 1:
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(tokenPayload{Error: "authorization_pending"})
+		case 2:
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(tokenPayload{Error: "slow_down", Interval: 12})
+		default:
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(tokenPayload{
+				AccessToken: "device-access-token-xyz",
+				TokenType:   "Bearer",
+			})
+		}
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	var sleeps []time.Duration
+	var slowDowns []time.Duration
+	exchangeHTTP := func(reqCtx context.Context, endpoint string) (*tokenPayload, *oauth.DevicePollError, error) {
+		req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, endpoint, strings.NewReader("grant_type=urn:ietf:params:oauth:grant-type:device_code"))
+		if err != nil {
+			return nil, nil, err
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		resp, err := srv.Client().Do(req)
+		if err != nil {
+			return nil, nil, err
+		}
+		defer resp.Body.Close()
+
+		var p tokenPayload
+		if decErr := json.NewDecoder(resp.Body).Decode(&p); decErr != nil {
+			return nil, &oauth.DevicePollError{Cause: decErr}, nil
+		}
+		if p.Error != "" {
+			return nil, &oauth.DevicePollError{
+				Code:        p.Error,
+				Description: p.ErrorDesc,
+				Interval:    p.Interval,
+			}, nil
+		}
+		return &p, nil, nil
+	}
+
+	tok, err := oauth.PollDeviceToken(ctx, oauth.DevicePollConfig{
+		Interval: 5 * time.Second,
+		Sleep: func(ctx context.Context, d time.Duration) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			sleeps = append(sleeps, d)
+			return nil
+		},
+		OnSlowDown: func(d time.Duration) {
+			slowDowns = append(slowDowns, d)
+		},
+	}, func(reqCtx context.Context) (*tokenPayload, *oauth.DevicePollError, error) {
+		return exchangeHTTP(reqCtx, srv.URL)
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, tok)
+	assert.Equal(t, "device-access-token-xyz", tok.AccessToken)
+	assert.Equal(t, []time.Duration{6 * time.Second, 6 * time.Second, 13 * time.Second}, sleeps)
+	assert.Equal(t, []time.Duration{12 * time.Second}, slowDowns)
+
+	// Verify terminal sentinel mapping and control-character sanitization over HTTP.
+	expSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(tokenPayload{
+			Error:     "expired_token",
+			ErrorDesc: "\x1b[33mDevice verification code expired\x07",
+		})
+	}))
+	defer expSrv.Close()
+
+	_, err = oauth.PollDeviceToken(ctx, oauth.DevicePollConfig{
+		Sleep: func(context.Context, time.Duration) error { return nil },
+	}, func(reqCtx context.Context) (*tokenPayload, *oauth.DevicePollError, error) {
+		return exchangeHTTP(reqCtx, expSrv.URL)
+	})
+	require.ErrorIs(t, err, oauth.ErrDeviceCodeExpired)
+	assert.Contains(t, err.Error(), "Device verification code expired")
+	assert.NotContains(t, err.Error(), "\x1b")
+
+	errSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(tokenPayload{
+			Error:     "authorization_declined",
+			ErrorDesc: "\x1b[31mUser declined device sign-in\x07",
+		})
+	}))
+	defer errSrv.Close()
+
+	_, err = oauth.PollDeviceToken(ctx, oauth.DevicePollConfig{
+		Sleep: func(context.Context, time.Duration) error { return nil },
+	}, func(reqCtx context.Context) (*tokenPayload, *oauth.DevicePollError, error) {
+		return exchangeHTTP(reqCtx, errSrv.URL)
+	})
+	require.ErrorIs(t, err, oauth.ErrDeviceAccessDenied)
+	assert.Contains(t, err.Error(), "User declined device sign-in")
+	assert.NotContains(t, err.Error(), "\x1b")
+
+	// Verify HTTP client timeout triggers exponential polling backoff while active.
+	var timeoutAttempts atomic.Int32
+	timeoutSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if timeoutAttempts.Add(1) == 1 {
+			select {
+			case <-time.After(80 * time.Millisecond):
+			case <-r.Context().Done():
+			}
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(tokenPayload{
+			AccessToken: "post-timeout-token",
+			TokenType:   "Bearer",
+		})
+	}))
+	defer timeoutSrv.Close()
+
+	shortClient := &http.Client{Timeout: 15 * time.Millisecond}
+	var timeoutSleeps []time.Duration
+	timeoutTok, err := oauth.PollDeviceToken(ctx, oauth.DevicePollConfig{
+		Interval:             5 * time.Second,
+		RetryTransientErrors: true,
+		Sleep: func(sleepCtx context.Context, d time.Duration) error {
+			if err := sleepCtx.Err(); err != nil {
+				return err
+			}
+			timeoutSleeps = append(timeoutSleeps, d)
+			return nil
+		},
+	}, func(reqCtx context.Context) (*tokenPayload, *oauth.DevicePollError, error) {
+		req, reqErr := http.NewRequestWithContext(reqCtx, http.MethodPost, timeoutSrv.URL, strings.NewReader("grant_type=urn:ietf:params:oauth:grant-type:device_code"))
+		if reqErr != nil {
+			return nil, nil, reqErr
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		resp, doErr := shortClient.Do(req)
+		if doErr != nil {
+			return nil, nil, doErr
+		}
+		defer resp.Body.Close()
+		var p tokenPayload
+		if decErr := json.NewDecoder(resp.Body).Decode(&p); decErr != nil {
+			return nil, &oauth.DevicePollError{Cause: decErr}, nil
+		}
+		return &p, nil, nil
+	})
+	require.NoError(t, err)
+	require.NotNil(t, timeoutTok)
+	assert.Equal(t, "post-timeout-token", timeoutTok.AccessToken)
+	assert.Equal(t, []time.Duration{6 * time.Second, 11 * time.Second}, timeoutSleeps)
 }
